@@ -4159,6 +4159,116 @@ class TestOnShotDetected:
 
         assert shot.spin_axis_deg is None
 
+    # --- Early OPS preview (shot shown before OPS clock sync / re-arm) ---
+
+    def _slow_path_with_inline_worker(self, monkeypatch):
+        """Camera present (slow enrichment), background worker run inline."""
+        emitted, session_log = self._record_finalization(monkeypatch)
+        monkeypatch.setattr(server_module, "shot_enrichment_queue", self._enrichment_queue())
+        monkeypatch.setattr(server_module, "shot_enrichment_task", None)
+        monkeypatch.setattr(server_module, "iwr6843_runtime", None)
+        monkeypatch.setattr(server_module, "camera_capture_runtime", object())
+        workers = []
+        monkeypatch.setattr(
+            server_module.socketio,
+            "start_background_task",
+            lambda target, *_a, **_k: workers.append(target) or object(),
+        )
+        enriched_impacts = []
+
+        def fake_enrichment(shot):
+            enriched_impacts.append(shot.impact_timestamp)
+            return server_module._ShotEnrichmentResult()
+
+        monkeypatch.setattr(server_module, "_enrich_shot_from_optional_hardware", fake_enrichment)
+        return emitted, session_log, workers, enriched_impacts
+
+    def test_preview_emits_shot_once_then_final_only_updates(self, monkeypatch):
+        emitted, session_log, workers, enriched_impacts = self._slow_path_with_inline_worker(
+            monkeypatch
+        )
+        shot = self._shot()
+
+        server_module.on_shot_preview(shot)
+
+        assert [event for event, _payload in emitted] == ["shot"]
+        assert emitted[0][1]["pending"] == {"camera": True}
+        assert shot.shot_number == 1
+        assert shot.profile_id is not None
+        assert workers == [], "enrichment must wait for the synced final callback"
+
+        shot.impact_timestamp = 42.5  # refined by the OPS clock sync
+        on_shot_detected(shot)
+        workers[0]()
+        self._wait_for_finalization_coordinator_idle()
+
+        events = [event for event, _payload in emitted]
+        assert events.count("shot") == 1, events
+        assert events[-1] == "shot_update"
+        assert enriched_impacts == [42.5], "enrichment must use the synced impact time"
+        assert shot.shot_number == 1
+        assert len(session_log.shots) == 1
+        self._assert_finalization_coordinator_empty()
+        assert not server_module._previewed_shots
+
+    def test_preview_without_slow_hardware_final_emits_update(self, monkeypatch):
+        emitted, session_log = self._record_finalization(monkeypatch)
+        monkeypatch.setattr(server_module, "iwr6843_runtime", None)
+        shot = self._shot()
+
+        server_module.on_shot_preview(shot)
+        on_shot_detected(shot)
+        self._wait_for_finalization_coordinator_idle()
+
+        assert [event for event, _payload in emitted] == ["shot", "shot_update"]
+        assert emitted[0][1]["pending"] == {}
+        self._assert_finalized_once(emitted, session_log)
+        assert not server_module._previewed_shots
+
+    def test_failed_preview_emit_falls_back_to_full_shot_event(self, monkeypatch):
+        emitted, session_log = self._record_finalization(monkeypatch)
+        monkeypatch.setattr(server_module, "iwr6843_runtime", None)
+        calls = {"n": 0}
+
+        def flaky_emit(event, payload):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("socket hiccup")
+            emitted.append((event, payload))
+
+        monkeypatch.setattr(server_module.socketio, "emit", flaky_emit)
+        shot = self._shot()
+
+        server_module.on_shot_preview(shot)
+        on_shot_detected(shot)
+        self._wait_for_finalization_coordinator_idle()
+
+        assert [event for event, _payload in emitted] == ["shot"], (
+            "the UI never got the preview, so the final emit must be a full 'shot'"
+        )
+        assert len(session_log.shots) == 1
+
+    def test_on_shot_detected_without_preview_is_unchanged(self, monkeypatch):
+        emitted, session_log = self._record_finalization(monkeypatch)
+        monkeypatch.setattr(server_module, "iwr6843_runtime", None)
+
+        on_shot_detected(self._shot())
+        self._wait_for_finalization_coordinator_idle()
+
+        assert [event for event, _payload in emitted] == ["shot"]
+        assert len(session_log.shots) == 1
+
+    def test_previewed_shot_registry_is_bounded(self, monkeypatch):
+        """Previews whose final callback never arrives must not leak."""
+        self._record_finalization(monkeypatch)
+        monkeypatch.setattr(server_module, "iwr6843_runtime", None)
+
+        for second in range(server_module._PREVIEWED_SHOTS_CAPACITY + 5):
+            server_module.on_shot_preview(self._shot(second % 60))
+
+        assert len(server_module._previewed_shots) == server_module._PREVIEWED_SHOTS_CAPACITY
+        server_module._previewed_shots.clear()
+
 
 class TestBallisticsConfiguration:
     """The physics model is preferred unless an operator explicitly opts out."""

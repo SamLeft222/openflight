@@ -592,6 +592,7 @@ class SessionLogger:
         trigger_timestamp_source: Optional[str] = None,
         clock_sync_offset_s: Optional[float] = None,
         post_trigger_duration_ms: Optional[float] = None,
+        stage_timings_ms: Optional[dict] = None,
     ):
         """
         Log raw rolling buffer capture data for offline analysis.
@@ -648,6 +649,8 @@ class SessionLogger:
             trigger_timestamp_source: Method used to infer trigger_timestamp
             clock_sync_offset_s: Host epoch minus OPS radar clock, when available
             post_trigger_duration_ms: Duration of the capture after trigger
+            stage_timings_ms: Per-stage pipeline durations (dump transfer,
+                parse, processing, impact-to-preview, clock sync, re-arm)
         """
         if not self.enabled:
             return
@@ -703,6 +706,7 @@ class SessionLogger:
                 ),
                 "clock_sync_offset_s": clock_sync_offset_s,
                 "post_trigger_duration_ms": post_trigger_duration_ms,
+                "stage_timings_ms": stage_timings_ms,
                 "smash_factor": smash_factor,
                 "spin_rpm": spin_rpm,
                 "spin_confidence": spin_confidence,

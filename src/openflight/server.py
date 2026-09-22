@@ -14,7 +14,7 @@ import statistics
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
@@ -182,6 +182,12 @@ _shot_finalization_registered: dict[int, "_RegisteredShotFinalization"] = {}
 _shot_finalization_ready: dict[int, "_PendingShotFinalization"] = {}
 _shot_finalization_running = False
 _shot_finalization_worker: threading.Thread | None = None
+# Shots whose OPS metrics were shown by on_shot_preview() and are waiting for
+# their synced on_shot_detected() call, keyed by Shot.timestamp (the UI's row
+# identity). Guarded by _shot_callback_lock. Bounded so a preview whose final
+# callback never arrives cannot leak.
+_PREVIEWED_SHOTS_CAPACITY = 16
+_previewed_shots: "OrderedDict[datetime, _ShotPreview]" = OrderedDict()
 
 
 @dataclass(frozen=True)
@@ -191,6 +197,14 @@ class _ShotEnrichmentResult:
     iwr6843_ms: float | None = None
     kld7_ms: float | None = None
     camera_capture_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class _ShotPreview:
+    """Outcome of the early OPS-only emit for one shot."""
+
+    emitted: bool
+    initial_ui_ms: float | None
 
 
 @dataclass(frozen=True)
@@ -3511,38 +3525,73 @@ def _defer_shot_enrichment(
             raise
 
 
+def on_shot_preview(shot: Shot) -> None:
+    """Show OPS metrics immediately, before the OPS clock sync and re-arm.
+
+    The monitor calls on_shot_detected() with the same Shot afterwards, once
+    impact timestamps are synced; enrichment and finalization start there.
+    """
+    with _shot_callback_lock:
+        _stamp_shot_identity(shot)
+        emitted = _emit_initial_ops_shot(shot)
+        _previewed_shots[shot.timestamp] = _ShotPreview(
+            emitted=emitted,
+            initial_ui_ms=_initial_ui_latency_ms(shot, emitted),
+        )
+        while len(_previewed_shots) > _PREVIEWED_SHOTS_CAPACITY:
+            stale_timestamp, _stale = _previewed_shots.popitem(last=False)
+            logger.warning(
+                "[SERVER] Dropping shot preview %s: final callback never arrived",
+                stale_timestamp.isoformat(),
+            )
+
+
 def on_shot_detected(shot: Shot) -> None:
     """Serialize detection order before publishing or queueing a shot."""
     with _shot_callback_lock:
         _handle_shot_detected(shot)
 
 
-def _handle_shot_detected(shot: Shot) -> None:
-    """Publish OPS metrics promptly, then enrich optional hardware data."""
+def _stamp_shot_identity(shot: Shot) -> None:
+    """Assign the session shot number and active profile."""
     _assign_shot_number(shot)
     active_profile = get_profile_store().get_active()
     shot.profile_id = active_profile.id
     shot.profile_name = active_profile.name
+
+
+def _initial_ui_latency_ms(shot: Shot, emitted: bool) -> float | None:
+    """Impact-to-UI latency of the first OPS emit, logged for diagnostics."""
+    if not emitted or shot.impact_timestamp is None:
+        return None
+    initial_ui_ms = max(0.0, (time.time() - shot.impact_timestamp) * 1000.0)
+    logger.info("[SERVER] Initial OPS metrics emitted %.0fms after impact", initial_ui_ms)
+    return initial_ui_ms
+
+
+def _handle_shot_detected(shot: Shot) -> None:
+    """Publish OPS metrics promptly, then enrich optional hardware data."""
+    preview = _previewed_shots.pop(shot.timestamp, None)
+    if preview is None:
+        _stamp_shot_identity(shot)
     logger.info("[SERVER] Shot callback: %.1f mph", shot.ball_speed_mph)
 
     if not _has_slow_shot_enrichment(shot):
+        emit_event = "shot_update" if preview is not None and preview.emitted else "shot"
+        initial_ui_ms = preview.initial_ui_ms if preview is not None else None
         _register_shot_for_finalization(
             shot,
-            emit_event="shot",
-            initial_ui_ms=None,
+            emit_event=emit_event,
+            initial_ui_ms=initial_ui_ms,
         )
-        _finish_shot_detected(shot, emit_event="shot")
+        _finish_shot_detected(shot, emit_event=emit_event, initial_ui_ms=initial_ui_ms)
         return
 
-    emitted = _emit_initial_ops_shot(shot)
-    initial_ui_ms = None
-    if emitted and shot.impact_timestamp is not None:
-        initial_ui_ms = max(0.0, (time.time() - shot.impact_timestamp) * 1000.0)
-        logger.info(
-            "[SERVER] Initial OPS metrics emitted %.0fms after impact; "
-            "hardware enrichment continues in background",
-            initial_ui_ms,
-        )
+    if preview is not None:
+        emitted, initial_ui_ms = preview.emitted, preview.initial_ui_ms
+    else:
+        emitted = _emit_initial_ops_shot(shot)
+        initial_ui_ms = _initial_ui_latency_ms(shot, emitted)
     final_event = "shot_update" if emitted else "shot"
     _register_shot_for_finalization(
         shot,
@@ -3823,6 +3872,7 @@ def start_monitor(
             live_callback=on_live_reading,
             diagnostic_callback=on_trigger_diagnostic,
             processing_callback=on_shot_processing,
+            shot_preview_callback=on_shot_preview,
         )
         if iwr6843_runtime is not None:
             iwr6843_runtime.capture_monitor.arm()

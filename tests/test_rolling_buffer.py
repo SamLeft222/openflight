@@ -611,6 +611,9 @@ class TestSoundTriggerTimestampPropagation:
             '{"sample_time": 0.0}',
             first_byte_timestamp=12345.678,
         )
+        # Accepted: re-arm is deferred until the caller has shown the shot.
+        radar.rearm_rolling_buffer.assert_not_called()
+        trigger.finish_capture(radar, result, sync_clock=True)
         radar.rearm_rolling_buffer.assert_called_once_with(12)
 
     def test_sound_trigger_prefers_ops_clock_sync_for_trigger_timestamp(self):
@@ -661,6 +664,7 @@ class TestSoundTriggerTimestampPropagation:
 
         trigger = SoundTrigger(pre_trigger_segments=12)
         result = trigger.wait_for_trigger(radar, processor, timeout=1.0)
+        trigger.finish_capture(radar, result, sync_clock=True)
 
         assert result is capture
         assert result.trigger_timestamp == pytest.approx(12100.068)
@@ -734,6 +738,7 @@ class TestSoundTriggerTimestampPropagation:
 
         trigger = SoundTrigger(pre_trigger_segments=12)
         result = trigger.wait_for_trigger(radar, processor, timeout=1.0)
+        trigger.finish_capture(radar, result, sync_clock=True)
 
         assert result is capture
         assert result.trigger_timestamp == pytest.approx(12100.068)
@@ -1153,6 +1158,10 @@ class TestRollingBufferShotIdentity:
                     if self.calls == 1:
                         return processed.capture
                     monitor._running = False
+                    return None
+
+                @staticmethod
+                def finish_capture(*_args, **_kwargs):
                     return None
 
                 @staticmethod
@@ -2800,6 +2809,10 @@ class TestShutdownPreservesRollingBuffer:
                 return None
 
             @staticmethod
+            def finish_capture(*_args, **_kwargs):
+                return None
+
+            @staticmethod
             def drain_diagnostics():
                 return [
                     {
@@ -2874,6 +2887,10 @@ class TestShutdownPreservesRollingBuffer:
                 return None
 
             @staticmethod
+            def finish_capture(*_args, **_kwargs):
+                return None
+
+            @staticmethod
             def drain_diagnostics():
                 return [{"accepted": True, "reason": "accepted", "response_bytes": 4096}]
 
@@ -2921,6 +2938,10 @@ class TestShutdownPreservesRollingBuffer:
                 return None
 
             @staticmethod
+            def finish_capture(*_args, **_kwargs):
+                return None
+
+            @staticmethod
             def drain_diagnostics():
                 return [{"accepted": False, "reason": reason}]
 
@@ -2951,6 +2972,10 @@ class TestShutdownPreservesRollingBuffer:
                 self.calls += 1
                 if self.calls > 1:
                     monitor._running = False
+                return None
+
+            @staticmethod
+            def finish_capture(*_args, **_kwargs):
                 return None
 
             @staticmethod

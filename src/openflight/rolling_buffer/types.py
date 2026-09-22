@@ -7,7 +7,7 @@ the processed speed timeline, and spin detection results.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -28,6 +28,9 @@ class IQCapture:
             hardware-triggered capture arrived from the radar.
         trigger_timestamp: Host epoch timestamp when the hardware trigger fired,
             derived from first_byte_timestamp and the post-trigger buffer span.
+        stage_timings_ms: Wall-clock duration of each pipeline stage for this
+            capture (dump transfer, parse, clock sync, re-arm, processing, ...),
+            filled in by the trigger and monitor for latency diagnostics.
     """
 
     sample_time: float
@@ -39,6 +42,7 @@ class IQCapture:
     trigger_timestamp: Optional[float] = None
     trigger_timestamp_source: Optional[str] = None
     clock_sync_offset_s: Optional[float] = None
+    stage_timings_ms: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Infer the hardware trigger epoch when first-byte timing is available."""

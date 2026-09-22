@@ -159,6 +159,22 @@ class TriggerStrategy(ABC):
         """
         pass
 
+    def finish_capture(
+        self,
+        radar: "OPS243Radar",
+        capture: IQCapture,
+        *,
+        sync_clock: bool,
+    ) -> None:
+        """Finish post-capture radar work for a capture returned by wait_for_trigger().
+
+        The monitor calls this exactly once per returned capture, after it has
+        shown the shot. ``sync_clock`` is True only for accepted shots. The
+        default is a no-op: strategies whose wait_for_trigger() leaves the
+        radar ready for the next capture have nothing deferred.
+        """
+        del radar, capture, sync_clock
+
     @abstractmethod
     def reset(self):
         """Reset trigger state for next capture."""
@@ -356,6 +372,9 @@ class SoundTrigger(TriggerStrategy):
                 The trigger does NOT configure rolling buffer mode itself.
         """
         super().__init__(pre_trigger_segments=pre_trigger_segments)
+        # Accepted capture handed to the caller whose clock sync + re-arm
+        # are deferred to finish_capture(). While set, the radar is Idle.
+        self._unfinished_capture: Optional[IQCapture] = None
 
     @staticmethod
     def _clock_sync_last_read_host_time(clock_sync: dict) -> Optional[float]:
@@ -575,6 +594,13 @@ class SoundTrigger(TriggerStrategy):
         output, causing the radar to dump its rolling buffer automatically.
         We just block on serial read waiting for the I/Q data to arrive.
         """
+        if self._unfinished_capture is not None:
+            # A caller skipped finish_capture(): the radar is still Idle from
+            # the last dump and would ignore every trigger. Re-arm now.
+            logger.warning("[TRIGGER] Previous capture was never finished; re-arming")
+            self._unfinished_capture = None
+            radar.rearm_rolling_buffer(self.pre_trigger_segments)
+
         logger.info("[TRIGGER] Waiting for sound trigger (timeout=%.0fs)...", timeout)
 
         response = radar.wait_for_hardware_trigger(
@@ -584,33 +610,108 @@ class SoundTrigger(TriggerStrategy):
         )
 
         if not response:
-            logger.info("[TRIGGER] Sound trigger timeout — no hardware trigger received")
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            # Watchdog: re-arm on every idle timeout. If a previous re-arm
+            # failed (write timeout) or a dump arrived without a recognizable
+            # start marker, the radar is sitting in Idle with the blue dump
+            # light on and will never dump again — waiting alone can't
+            # recover it. PA on an already-armed radar just restarts sampling.
+            logger.info("[TRIGGER] Sound trigger timeout — no hardware trigger received; re-arming")
+            radar.rearm_rolling_buffer(self.pre_trigger_segments)
             return None
 
+        dump_done = time.time()
+        stage_timings: dict = {}
+        first_byte_timestamp = getattr(radar, "last_hardware_trigger_first_byte_timestamp", None)
+        if first_byte_timestamp is not None:
+            stage_timings["dump_ms"] = max(0.0, (dump_done - first_byte_timestamp) * 1000.0)
+
+        # Once a dump has been read the radar is Idle until re-armed. Rejected
+        # and failed dumps re-arm right here, and any exception still re-arms
+        # (field symptom otherwise: blue light stuck on, no more hits read).
+        # Accepted captures are handed back un-synced and un-armed so the
+        # caller can show the shot first; finish_capture() does the rest.
+        capture = None
+        try:
+            capture = self._handle_dump(processor, response, first_byte_timestamp, stage_timings)
+            return capture
+        finally:
+            if capture is not None:
+                self._unfinished_capture = capture
+            else:
+                radar.rearm_rolling_buffer(self.pre_trigger_segments)
+
+    def finish_capture(
+        self,
+        radar: "OPS243Radar",
+        capture: IQCapture,
+        *,
+        sync_clock: bool,
+    ) -> None:
+        """Clock-sync (accepted shots only) and re-arm after the shot is shown.
+
+        ORDERING MATTERS: after its dump the radar sits idle, where HOST_INT
+        pulses are harmless. A real shot produces a second loud sound ~1s
+        later (ball hitting the net); if we re-arm first, that sound starts a
+        new dump exactly when the clock-sync exchange writes to the port — a
+        two-way serial deadlock observed in the field (capture thread wedged
+        in serial.write, radar frozen mid-dump). So: do all wire-talk (clock
+        sync) while idle, and re-arm LAST, even if the sync raises.
+
+        Idempotent: only the capture most recently returned by
+        wait_for_trigger() is finished, and only once.
+        """
+        if capture is None or capture is not self._unfinished_capture:
+            return
+        self._unfinished_capture = None
+        timings = capture.stage_timings_ms
+        try:
+            if sync_clock:
+                sync_start = time.time()
+                try:
+                    self._select_clock_sync_for_capture(radar, capture)
+                finally:
+                    timings["clock_sync_ms"] = (time.time() - sync_start) * 1000.0
+                self._log_trigger_wall_time(capture)
+        finally:
+            rearm_start = time.time()
+            try:
+                radar.rearm_rolling_buffer(self.pre_trigger_segments)
+            finally:
+                timings["rearm_ms"] = (time.time() - rearm_start) * 1000.0
+
+    @staticmethod
+    def _log_trigger_wall_time(capture: IQCapture) -> None:
+        if capture.trigger_timestamp is not None and capture.first_byte_timestamp is not None:
+            logger.info(
+                "[TRIGGER] Sound trigger wall time %.3f "
+                "(source=%s, first byte %.3f, post-trigger %.1fms)",
+                capture.trigger_timestamp,
+                capture.trigger_timestamp_source or "unknown",
+                capture.first_byte_timestamp,
+                capture.post_trigger_duration_ms,
+            )
+
+    def _handle_dump(
+        self,
+        processor: RollingBufferProcessor,
+        response: str,
+        first_byte_timestamp: Optional[float],
+        stage_timings: dict,
+    ) -> Optional[IQCapture]:
+        """Parse and validate a hardware-triggered dump. No serial I/O."""
         response_len = len(response)
         logger.info("[TRIGGER] Sound trigger fired, %d bytes received", response_len)
-        first_byte_timestamp = getattr(
-            radar,
-            "last_hardware_trigger_first_byte_timestamp",
-            None,
-        )
 
-        # ORDERING MATTERS: after its dump the radar sits idle, where
-        # HOST_INT pulses are harmless. A real shot produces a second loud
-        # sound ~1s later (ball hitting the net); if we re-arm first, that
-        # sound starts a new dump exactly when the clock-sync exchange
-        # writes to the port — a two-way serial deadlock observed in the
-        # field (capture thread wedged in serial.write, radar frozen
-        # mid-dump). So: do all wire-talk (clock sync) while idle, and
-        # re-arm LAST, when we are about to go back to reading.
-
+        parse_start = time.time()
         capture = processor.parse_capture(
             response,
             first_byte_timestamp=first_byte_timestamp,
         )
+        stage_timings["parse_ms"] = (time.time() - parse_start) * 1000.0
 
         if not capture:
-            radar.rearm_rolling_buffer(self.pre_trigger_segments)
             logger.warning("[TRIGGER] Sound trigger parse failed (%d bytes received)", response_len)
             self._append_diagnostic(
                 accepted=False,
@@ -621,17 +722,22 @@ class SoundTrigger(TriggerStrategy):
 
         if first_byte_timestamp is not None and capture.first_byte_timestamp is None:
             capture.first_byte_timestamp = float(first_byte_timestamp)
+        # First-byte timing now, so the early shot preview has an impact
+        # time; finish_capture() refines it from the OPS clock when usable.
+        if capture.first_byte_timestamp is not None and capture.trigger_timestamp is None:
+            capture.apply_trigger_timestamp_from_first_byte()
 
         # Quick validation: does the capture contain any real swing data?
         # At a driving range, a nearby player's impact sound can trip the
         # trigger even though nothing was moving in front of our radar.
-        # Discard these false triggers immediately so we re-arm fast.
+        # Discard these false triggers immediately (no clock sync) so the
+        # caller re-arms fast and the next real swing isn't missed.
+        check_start = time.time()
         summary = self._summarize_capture_activity(processor, capture)
+        stage_timings["activity_check_ms"] = (time.time() - check_start) * 1000.0
+        capture.stage_timings_ms.update(stage_timings)
 
         if not summary["valid_outbound_count"]:
-            # False trigger: re-arm immediately (no clock sync) so the
-            # next real swing isn't missed.
-            radar.rearm_rolling_buffer(self.pre_trigger_segments)
             logger.info(
                 "[TRIGGER] Sound trigger rejected — no outbound speed >= %.0f mph "
                 "(peak=%.1f mph, %d readings)",
@@ -646,24 +752,6 @@ class SoundTrigger(TriggerStrategy):
                 response_bytes=response_len,
             )
             return None
-
-        # Accepted: talk on the wire while the radar is still idle, then
-        # re-arm as the last serial action before returning to the reader.
-        self._select_clock_sync_for_capture(radar, capture)
-        radar.rearm_rolling_buffer(self.pre_trigger_segments)
-
-        if capture.first_byte_timestamp is not None and capture.trigger_timestamp is None:
-            capture.apply_trigger_timestamp_from_first_byte()
-
-        if capture.trigger_timestamp is not None and capture.first_byte_timestamp is not None:
-            logger.info(
-                "[TRIGGER] Sound trigger wall time %.3f "
-                "(source=%s, first byte %.3f, post-trigger %.1fms)",
-                capture.trigger_timestamp,
-                capture.trigger_timestamp_source or "unknown",
-                capture.first_byte_timestamp,
-                capture.post_trigger_duration_ms,
-            )
 
         logger.info(
             "[TRIGGER] Sound trigger accepted — peak %.1f mph, %d outbound readings",
