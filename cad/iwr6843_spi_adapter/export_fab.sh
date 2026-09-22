@@ -43,6 +43,7 @@ rm fab/positions_all.csv
     --layers "B.Fab,B.Silkscreen,B.Courtyard,Edge.Cuts" \
     -o fab/assembly/assembly_bottom_mirrored.pdf "$NAME.kicad_pcb"
 
+(cd fab && rm -f pcbway_assembly_files.zip && zip -q pcbway_assembly_files.zip pcbway_bom.csv pcbway_cpl.csv assembly/*.pdf)
 rm -f fab/positions.csv
 echo "fab/ ready:"
 ls -R fab
