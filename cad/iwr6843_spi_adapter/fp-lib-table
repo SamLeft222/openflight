@@ -1,0 +1,4 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "openflight_adapter") (type "KiCad") (uri "${KIPRJMOD}/openflight_adapter.pretty") (options "") (descr "OpenFlight SPI adapter footprints"))
+)
