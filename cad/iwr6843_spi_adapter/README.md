@@ -39,14 +39,29 @@ inert and nothing back-feeds the unpowered chip.
    pin tails, which must be trimmed flush (≤1 mm)** so they can't touch the
    LEVM's bottom components (J6 is nearby).
 
-## Ordering and assembly
+## Ordering and assembly (PCBWay turnkey)
 
-* Upload `fab/gerbers/` (Gerbers, drill, job file), `fab/bom.csv` and
-  `fab/positions.csv`. Origin is the board's lower-left corner.
-* Samtec QTH is rarely stocked by LCSC; PCBWay turnkey (global sourcing) or a
-  consigned part is the easy route. J1 is 0.5 mm pitch: have it reflowed.
-  The SOT-23-6 and 0603 parts are hand-solderable.
-* Both sides have parts (J1 and C3 on the bottom).
+Run `./export_fab.sh` (regenerates, runs ERC/DRC, and exports into `fab/`):
+
+| Upload | File |
+|---|---|
+| Gerbers + drills | `fab/iwr6843_spi_adapter-gerbers.zip` |
+| BOM (PCBWay columns, MPNs) | `fab/pcbway_bom.csv` |
+| Centroid / CPL | `fab/pcbway_cpl.csv` (origin = board lower-left, J2 excluded) |
+| Assembly drawings | `fab/assembly/assembly_top.pdf`, `fab/assembly/assembly_bottom_mirrored.pdf` |
+
+PCB options: 2 layers, FR-4, 1.6 mm, 1 oz, **ENIG** (flat pads for the
+0.5 mm-pitch J1; HASL is too uneven), min track/spacing 5/5 mil, min hole
+0.3 mm, tented vias, any mask colour.
+
+Assembly: turnkey, **both sides** (J1 and C3 on the bottom, the rest on top).
+J2 is not in the BOM or CPL. Solder it yourself and trim the tails flush.
+Notes to include with the order:
+
+> J1 (Samtec QTH-030-01-L-D-A) is on the BOTTOM side; its -A alignment pins go
+> into the two 1.02 mm NPTH holes; pin 1 is marked on the bottom assembly
+> drawing. U1-U3 pin 1 per the silkscreen dot. J2 (1x11 header) is NOT
+> assembled. Please send placement confirmation images before production.
 
 ## LEVM setup
 

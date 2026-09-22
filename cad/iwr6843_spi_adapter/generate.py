@@ -61,6 +61,11 @@ class Part:
     units: int = 1
     datasheet: str = ""
     mpn: str = ""
+    manufacturer: str = ""
+    description: str = ""
+    # Whether the assembler places it (J2 is hand-soldered so its tails can
+    # be trimmed flush; see README).
+    assemble: bool = True
     # Schematic placement for each unit: list of (x, y) in mm.
     sch_at: list = field(default_factory=list)
 
@@ -79,6 +84,8 @@ PARTS = [
         "QTH-030-01-L-D-A",
         QTH_FP,
         mpn="QTH-030-01-L-D-A",
+        manufacturer="Samtec",
+        description="0.5mm 2x30 Q Strip terminal, alignment pins, mates QSH-030-01",
         datasheet="https://suddendocs.samtec.com/prints/qth-xxx-xx-x-d-xx-mkt.pdf",
         sch_at=[(55.88, 101.6)],
     ),
@@ -87,7 +94,9 @@ PARTS = [
         "Connector_Generic:Conn_01x11",
         "Pi5_jumpers",
         HDR_FP,
-        mpn="2.54mm 1x11 pin header",
+        mpn="",
+        description="1x11 2.54mm male pin header (customer installs, trim tails flush)",
+        assemble=False,
         sch_at=[(254.0, 76.2)],
     ),
     # U1: radar-powered, Pi -> radar (ch2 = MOSI, ch1 = SCLK)
@@ -98,6 +107,8 @@ PARTS = [
         DBV_FP,
         units=3,
         mpn="SN74LVC2G34DBVR",
+        manufacturer="Texas Instruments",
+        description="Dual buffer, Ioff partial-power-down, SOT-23-6",
         datasheet=LVC_DS,
         sch_at=[(160.02, 45.72), (160.02, 60.96), (160.02, 30.48)],
     ),
@@ -109,6 +120,8 @@ PARTS = [
         DBV_FP,
         units=3,
         mpn="SN74LVC2G34DBVR",
+        manufacturer="Texas Instruments",
+        description="Dual buffer, Ioff partial-power-down, SOT-23-6",
         datasheet=LVC_DS,
         sch_at=[(160.02, 101.6), (160.02, 86.36), (187.96, 30.48)],
     ),
@@ -120,19 +133,111 @@ PARTS = [
         DBV_FP,
         units=3,
         mpn="SN74LVC2G34DBVR",
+        manufacturer="Texas Instruments",
+        description="Dual buffer, Ioff partial-power-down, SOT-23-6",
         datasheet=LVC_DS,
         sch_at=[(160.02, 132.08), (160.02, 147.32), (215.9, 30.48)],
     ),
-    Part("C1", "Device:C", "100nF", C0603, mpn="0603 X7R 100nF 16V", sch_at=[(132.08, 172.72)]),
-    Part("C2", "Device:C", "100nF", C0603, mpn="0603 X7R 100nF 16V", sch_at=[(142.24, 172.72)]),
-    Part("C3", "Device:C", "100nF", C0603, mpn="0603 X7R 100nF 16V", sch_at=[(152.4, 172.72)]),
-    Part("R1", "Device:R", "100k", R0603, mpn="0603 1% 100k", sch_at=[(203.2, 101.6)]),
-    Part("R2", "Device:R", "100k", R0603, mpn="0603 1% 100k", sch_at=[(203.2, 60.96)]),
-    Part("R3", "Device:R", "100k", R0603, mpn="0603 1% 100k", sch_at=[(203.2, 45.72)]),
-    Part("R4", "Device:R", "100k", R0603, mpn="0603 1% 100k", sch_at=[(119.38, 147.32)]),
-    Part("R5", "Device:R", "100k", R0603, mpn="0603 1% 100k", sch_at=[(119.38, 132.08)]),
-    Part("R6", "Device:R", "33", R0603, mpn="0603 1% 33R", sch_at=[(203.2, 132.08)]),
-    Part("R7", "Device:R", "33", R0603, mpn="0603 1% 33R", sch_at=[(203.2, 147.32)]),
+    Part(
+        "C1",
+        "Device:C",
+        "100nF",
+        C0603,
+        mpn="CL10B104KB8NNNC",
+        manufacturer="Samsung Electro-Mechanics",
+        description="100nF 50V X7R 0603 MLCC",
+        sch_at=[(132.08, 172.72)],
+    ),
+    Part(
+        "C2",
+        "Device:C",
+        "100nF",
+        C0603,
+        mpn="CL10B104KB8NNNC",
+        manufacturer="Samsung Electro-Mechanics",
+        description="100nF 50V X7R 0603 MLCC",
+        sch_at=[(142.24, 172.72)],
+    ),
+    Part(
+        "C3",
+        "Device:C",
+        "100nF",
+        C0603,
+        mpn="CL10B104KB8NNNC",
+        manufacturer="Samsung Electro-Mechanics",
+        description="100nF 50V X7R 0603 MLCC",
+        sch_at=[(152.4, 172.72)],
+    ),
+    Part(
+        "R1",
+        "Device:R",
+        "100k",
+        R0603,
+        mpn="RC0603FR-07100KL",
+        manufacturer="YAGEO",
+        description="100k 1% 0603 resistor",
+        sch_at=[(203.2, 101.6)],
+    ),
+    Part(
+        "R2",
+        "Device:R",
+        "100k",
+        R0603,
+        mpn="RC0603FR-07100KL",
+        manufacturer="YAGEO",
+        description="100k 1% 0603 resistor",
+        sch_at=[(203.2, 60.96)],
+    ),
+    Part(
+        "R3",
+        "Device:R",
+        "100k",
+        R0603,
+        mpn="RC0603FR-07100KL",
+        manufacturer="YAGEO",
+        description="100k 1% 0603 resistor",
+        sch_at=[(203.2, 45.72)],
+    ),
+    Part(
+        "R4",
+        "Device:R",
+        "100k",
+        R0603,
+        mpn="RC0603FR-07100KL",
+        manufacturer="YAGEO",
+        description="100k 1% 0603 resistor",
+        sch_at=[(119.38, 147.32)],
+    ),
+    Part(
+        "R5",
+        "Device:R",
+        "100k",
+        R0603,
+        mpn="RC0603FR-07100KL",
+        manufacturer="YAGEO",
+        description="100k 1% 0603 resistor",
+        sch_at=[(119.38, 132.08)],
+    ),
+    Part(
+        "R6",
+        "Device:R",
+        "33",
+        R0603,
+        mpn="RC0603FR-0733RL",
+        manufacturer="YAGEO",
+        description="33R 1% 0603 resistor",
+        sch_at=[(203.2, 132.08)],
+    ),
+    Part(
+        "R7",
+        "Device:R",
+        "33",
+        R0603,
+        mpn="RC0603FR-0733RL",
+        manufacturer="YAGEO",
+        description="33R 1% 0603 resistor",
+        sch_at=[(203.2, 147.32)],
+    ),
 ]
 
 # Nets: name -> list of (ref, pin).  J1 pin numbers are the IWR6843LEVM J1
@@ -578,12 +683,44 @@ def write_project() -> None:
     (HERE / f"{PROJECT}.kicad_pro").write_text(json.dumps(pro, indent=2) + "\n")
 
 
+def write_pcbway_bom() -> None:
+    """Turnkey BOM in PCBWay's column format (assembled parts only)."""
+    import csv
+
+    groups: dict[str, list[Part]] = {}
+    for part in PARTS:
+        if part.assemble:
+            groups.setdefault(part.mpn, []).append(part)
+    out = HERE / "fab" / "pcbway_bom.csv"
+    out.parent.mkdir(exist_ok=True)
+    with out.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["Line#", "Qty", "Designator", "MPN", "Manufacturer", "Description", "Package", "Type"]
+        )
+        for line, (mpn, parts) in enumerate(sorted(groups.items()), start=1):
+            first = parts[0]
+            writer.writerow(
+                [
+                    line,
+                    len(parts),
+                    ",".join(p.ref for p in parts),
+                    mpn,
+                    first.manufacturer,
+                    first.description,
+                    first.footprint.split(":")[1],
+                    "SMD",
+                ]
+            )
+
+
 if __name__ == "__main__":
     import sys
 
     write_footprints()
     write_project()
     write_schematic()
+    write_pcbway_bom()
     if "--sch-only" not in sys.argv:
         from build_pcb import build_pcb  # noqa: E402  (needs KiCad's pcbnew)
 
