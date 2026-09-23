@@ -356,6 +356,9 @@ class SoundTrigger(TriggerStrategy):
     CLOCK_SYNC_MAX_ROLLOVER_UNCERTAINTY_MS = 40.0
     CLOCK_SYNC_MAX_TIMEOUT_READ_MS = 50.0
     CLOCK_SYNC_MAX_FALLBACK_AGE_S = 60.0
+    # After a failed re-arm, waits are shortened to this so the re-arm is
+    # retried about once a second instead of after the full idle timeout.
+    REARM_RETRY_INTERVAL_S = 1.0
 
     def __init__(
         self,
@@ -375,6 +378,24 @@ class SoundTrigger(TriggerStrategy):
         # Accepted capture handed to the caller whose clock sync + re-arm
         # are deferred to finish_capture(). While set, the radar is Idle.
         self._unfinished_capture: Optional[IQCapture] = None
+        # A re-arm the radar would not take (write timeout). While set the
+        # radar may be Idle (blue light on) and every wait retries it.
+        self._rearm_pending = False
+
+    def _rearm(self, radar: "OPS243Radar") -> bool:
+        """Re-arm and remember a failure so the next wait retries it.
+
+        ``rearm_rolling_buffer`` returns False when the port refused the
+        commands; any other result (including None from older radars and
+        test fakes) counts as success.
+        """
+        ok = radar.rearm_rolling_buffer(self.pre_trigger_segments) is not False
+        if not ok:
+            logger.warning(
+                "[TRIGGER] Re-arm failed; retrying every %.0fs", self.REARM_RETRY_INTERVAL_S
+            )
+        self._rearm_pending = not ok
+        return ok
 
     @staticmethod
     def _clock_sync_last_read_host_time(clock_sync: dict) -> Optional[float]:
@@ -599,7 +620,11 @@ class SoundTrigger(TriggerStrategy):
             # the last dump and would ignore every trigger. Re-arm now.
             logger.warning("[TRIGGER] Previous capture was never finished; re-arming")
             self._unfinished_capture = None
-            radar.rearm_rolling_buffer(self.pre_trigger_segments)
+            self._rearm(radar)
+        elif self._rearm_pending:
+            self._rearm(radar)
+        if self._rearm_pending:
+            timeout = min(timeout, self.REARM_RETRY_INTERVAL_S)
 
         logger.info("[TRIGGER] Waiting for sound trigger (timeout=%.0fs)...", timeout)
 
@@ -612,13 +637,26 @@ class SoundTrigger(TriggerStrategy):
         if not response:
             if cancel_event is not None and cancel_event.is_set():
                 return None
-            # Watchdog: re-arm on every idle timeout. If a previous re-arm
-            # failed (write timeout) or a dump arrived without a recognizable
-            # start marker, the radar is sitting in Idle with the blue dump
-            # light on and will never dump again — waiting alone can't
-            # recover it. PA on an already-armed radar just restarts sampling.
-            logger.info("[TRIGGER] Sound trigger timeout — no hardware trigger received; re-arming")
-            radar.rearm_rolling_buffer(self.pre_trigger_segments)
+            orphan_bytes = getattr(radar, "last_hardware_trigger_orphan_bytes", 0) or 0
+            if orphan_bytes:
+                # A dump whose header was lost (e.g. a net-impact trigger
+                # between re-arm and this wait): the radar is Idle with the
+                # blue light on. Re-arm now rather than at the watchdog.
+                logger.warning(
+                    "[TRIGGER] Orphaned dump (%d bytes, no header); re-arming now",
+                    orphan_bytes,
+                )
+                self._append_diagnostic(
+                    accepted=False, reason="orphan_dump", response_bytes=orphan_bytes
+                )
+            else:
+                # Watchdog: a radar left Idle for an unexplained reason can
+                # never dump again, so every idle timeout re-arms. PA on an
+                # already-armed radar just restarts sampling.
+                logger.info(
+                    "[TRIGGER] Sound trigger timeout — no hardware trigger received; re-arming"
+                )
+            self._rearm(radar)
             return None
 
         dump_done = time.time()
@@ -640,7 +678,7 @@ class SoundTrigger(TriggerStrategy):
             if capture is not None:
                 self._unfinished_capture = capture
             else:
-                radar.rearm_rolling_buffer(self.pre_trigger_segments)
+                self._rearm(radar)
 
     def finish_capture(
         self,
@@ -677,7 +715,7 @@ class SoundTrigger(TriggerStrategy):
         finally:
             rearm_start = time.time()
             try:
-                radar.rearm_rolling_buffer(self.pre_trigger_segments)
+                self._rearm(radar)
             finally:
                 timings["rearm_ms"] = (time.time() - rearm_start) * 1000.0
 

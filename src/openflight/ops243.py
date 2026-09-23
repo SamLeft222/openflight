@@ -187,6 +187,12 @@ class OPS243Radar:
     # sending (immediate re-triggers or streaming-mode fallback) and the
     # drain must bail out loudly instead of hanging the monitor thread.
     REARM_DRAIN_TIMEOUT_S = 5.0
+    # Non-capture bytes above this size, followed by ORPHAN_DUMP_QUIET_S of
+    # silence, are a dump whose header was lost (not idle clock/whitespace
+    # noise, which is tens of bytes). The radar is idle after it and needs
+    # an immediate re-arm.
+    ORPHAN_DUMP_MIN_BYTES = 512
+    ORPHAN_DUMP_QUIET_S = 0.3
 
     # Common USB identifiers for OPS243
     VENDOR_IDS = [0x0483]  # STMicroelectronics
@@ -612,8 +618,7 @@ class OPS243Radar:
                 # mid-dump). Abandon the sync; the caller falls back to
                 # first-byte timing. Retrying writes would only re-block.
                 logger.warning(
-                    "[OPS] Clock sync C? write timed out — port jammed, "
-                    "abandoning clock sync"
+                    "[OPS] Clock sync C? write timed out — port jammed, abandoning clock sync"
                 )
                 return False
             buf = ""
@@ -1511,7 +1516,10 @@ class OPS243Radar:
         deadline = start_time + timeout
         last_data_time = None
         bytes_received = 0
+        stray_bytes = 0
+        last_stray_time = 0.0
         self.last_hardware_trigger_first_byte_timestamp = None
+        self.last_hardware_trigger_orphan_bytes = 0
 
         while time.time() < deadline:
             waiting = self.serial.in_waiting
@@ -1523,6 +1531,8 @@ class OPS243Radar:
                     marker_offsets = [idle_bytes.find(marker) for marker in capture_markers]
                     marker_offsets = [offset for offset in marker_offsets if offset >= 0]
                     if not marker_offsets:
+                        stray_bytes += len(chunk)
+                        last_stray_time = time.time()
                         # Preserve enough trailing bytes to recognize a marker split
                         # across reads, while discarding unsolicited CLI/clock noise.
                         max_marker = max(len(marker) for marker in capture_markers)
@@ -1571,6 +1581,19 @@ class OPS243Radar:
                 if cancel_event is not None and cancel_event.is_set() and last_data_time is None:
                     logger.info("[OPS] Hardware trigger wait cancelled before capture")
                     break
+                if (
+                    last_data_time is None
+                    and stray_bytes >= self.ORPHAN_DUMP_MIN_BYTES
+                    and time.time() - last_stray_time > self.ORPHAN_DUMP_QUIET_S
+                ):
+                    # A dump arrived without its header (cleared by the
+                    # reset above, or garbled). The radar is now idle.
+                    self.last_hardware_trigger_orphan_bytes = stray_bytes
+                    logger.warning(
+                        "[OPS] Orphaned dump: %d bytes with no capture header; radar left idle",
+                        stray_bytes,
+                    )
+                    break
                 # If we've started receiving data, use shorter timeout
                 if last_data_time and (time.time() - last_data_time) > 0.5:
                     full_response = "".join(response_lines)
@@ -1591,7 +1614,7 @@ class OPS243Radar:
 
         return full_response
 
-    def rearm_rolling_buffer(self, pre_trigger_segments: int = 16):
+    def rearm_rolling_buffer(self, pre_trigger_segments: int = 16) -> bool:
         """
         Re-arm rolling buffer for next capture.
 
@@ -1605,6 +1628,10 @@ class OPS243Radar:
         Args:
             pre_trigger_segments: Number of pre-trigger segments (0-32).
                 Each segment = 128 samples = ~4.27ms at 30ksps.
+
+        Returns:
+            True when the re-arm commands were written, False when the port
+            would not take them (radar busy); the caller should retry.
         """
         if not self.serial or not self.serial.is_open:
             raise ConnectionError("Not connected to radar")
@@ -1672,13 +1699,13 @@ class OPS243Radar:
             # next wait cycle reads out whatever the radar is sending and
             # re-arms again.
             logger.warning(
-                "[OPS] Re-arm write timed out — radar busy (mid-dump?); "
-                "re-arm will be retried after the next capture cycle"
+                "[OPS] Re-arm write timed out — radar busy (mid-dump?); the trigger retries it"
             )
-            return
+            return False
 
         self.serial.reset_input_buffer()
         logger.info("[OPS] Rolling buffer re-armed (S#%d)", pre_trigger_segments)
+        return True
 
     def configure_for_rolling_buffer(
         self, pre_trigger_segments: int = 16, sample_rate_ksps: int = 30

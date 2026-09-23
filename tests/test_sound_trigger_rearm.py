@@ -229,3 +229,91 @@ def test_stage_timings_recorded_on_capture():
         assert key in timings, f"missing {key}: {timings}"
         assert timings[key] >= 0.0
     assert timings["dump_ms"] == pytest.approx(1500.0, abs=250.0)
+
+
+# --- Faster recovery (stuck blue light): orphaned dumps and failed re-arms ---
+
+
+class RecordingRadar(ScriptedRadar):
+    """ScriptedRadar that records wait timeouts and scripts re-arm results."""
+
+    def __init__(self, response="", rearm_results=(), orphan_bytes=0):
+        super().__init__(response=response)
+        self.timeouts = []
+        self._rearm_results = list(rearm_results)
+        self.last_hardware_trigger_orphan_bytes = orphan_bytes
+
+    def wait_for_hardware_trigger(self, timeout, cancel_event=None, on_first_byte=None):
+        self.timeouts.append(timeout)
+        return super().wait_for_hardware_trigger(timeout, cancel_event, on_first_byte)
+
+    def rearm_rolling_buffer(self, pre_trigger_segments):
+        self.calls.append("rearm")
+        return self._rearm_results.pop(0) if self._rearm_results else True
+
+
+def test_orphaned_dump_rearms_immediately_and_is_diagnosed():
+    radar = RecordingRadar(response="", orphan_bytes=4096)
+    trigger = SoundTrigger()
+
+    capture = trigger.wait_for_trigger(radar, RollingBufferProcessor(), timeout=30.0)
+
+    assert capture is None
+    assert radar.calls == ["wait", "rearm"]
+    diagnostics = trigger.drain_diagnostics()
+    assert [d["reason"] for d in diagnostics] == ["orphan_dump"]
+    assert diagnostics[0]["response_bytes"] == 4096
+
+
+def test_plain_idle_timeout_is_not_diagnosed_as_orphan():
+    radar = RecordingRadar(response="", orphan_bytes=0)
+    trigger = SoundTrigger()
+
+    trigger.wait_for_trigger(radar, RollingBufferProcessor(), timeout=30.0)
+
+    assert radar.calls == ["wait", "rearm"]
+    assert trigger.drain_diagnostics() == []
+
+
+def test_failed_rearm_is_retried_about_every_second_until_it_succeeds():
+    radar = RecordingRadar(response="", rearm_results=[False, False, True])
+    trigger = SoundTrigger()
+    processor = RollingBufferProcessor()
+
+    trigger.wait_for_trigger(radar, processor, timeout=30.0)
+    trigger.wait_for_trigger(radar, processor, timeout=30.0)
+    trigger.wait_for_trigger(radar, processor, timeout=30.0)  # back to normal
+
+    # call 1: watchdog re-arm fails | call 2: retry fails, short wait, watchdog
+    # re-arm succeeds | call 3: normal wait and watchdog re-arm.
+    assert radar.calls == ["wait", "rearm", "rearm", "wait", "rearm", "wait", "rearm"]
+    # While a re-arm is pending the wait is shortened so retries come quickly;
+    # once it succeeds the normal (30 s) backstop applies again.
+    assert radar.timeouts == [30.0, SoundTrigger.REARM_RETRY_INTERVAL_S, 30.0]
+
+
+def test_failed_rearm_after_rejected_dump_is_retried():
+    i_samples, q_samples = synth_capture(rpm=3000, amplitude=0.0, noise_rms=1.0)
+    radar = RecordingRadar(
+        response=_dump_response(i_samples, q_samples), rearm_results=[False, True]
+    )
+    trigger = SoundTrigger()
+    processor = RollingBufferProcessor()
+
+    trigger.wait_for_trigger(radar, processor, timeout=30.0)  # rejected dump, re-arm fails
+    radar.response = ""
+    trigger.wait_for_trigger(radar, processor, timeout=30.0)
+
+    assert radar.calls[:4] == ["wait", "rearm", "rearm", "wait"]
+
+
+def test_legacy_rearm_returning_none_counts_as_success():
+    """Radars/fakes whose re-arm returns None (older contract) are not retried."""
+    radar = ScriptedRadar(response="")
+    radar.rearm_rolling_buffer = lambda pre_trigger_segments: radar.calls.append("rearm")
+    trigger = SoundTrigger()
+
+    trigger.wait_for_trigger(radar, RollingBufferProcessor(), timeout=0.1)
+    trigger.wait_for_trigger(radar, RollingBufferProcessor(), timeout=0.1)
+
+    assert radar.calls == ["wait", "rearm", "wait", "rearm"]
