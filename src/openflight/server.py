@@ -2313,6 +2313,31 @@ VERTICAL_SPREAD_ZERO_CONFIDENCE_DEG = 10.0
 SPIN_AXIS_MIN_CONFIDENCE = 0.6
 
 
+def iwr6843_launch_withheld_reason(measurement) -> str | None:
+    """Why an LCMF result the estimator accepted must not drive the shot.
+
+    Paired R10 sessions (2026-09-23, 42 shots) showed three accepted shapes
+    that were wrong almost every time, so they are withheld from the displayed
+    and carry launch angle; the shot falls back to the labelled estimate:
+
+    * single-channel results -- the other channel sat at its search-grid edge
+      or disagreed by >8 deg: 11 of 12 off by 6-34 deg;
+    * ``accepted_track_speed_warning`` -- the TI range walk disagrees with the
+      OPS ball speed and no OPS-compatible track exists: 2 of 2 off by 31-38;
+    * launch <= 0 deg -- the radar read a grounder (10.9 deg read as -2.1),
+      and the ballistic model carries any such ball exactly 0 yd.
+
+    The full measurement is still logged (iwr6843_capture) for diagnosis.
+    """
+    if getattr(measurement, "single_channel", False):
+        return "withheld_single_channel"
+    if getattr(measurement, "status", None) == "accepted_track_speed_warning":
+        return "withheld_track_speed_warning"
+    if measurement.angle_deg <= 0.0:
+        return "withheld_non_positive_launch"
+    return None
+
+
 def vertical_confidence(measurement) -> float:
     """Vertical launch confidence from channel agreement and corroboration.
 
@@ -2463,6 +2488,15 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
                 state="rejected",
                 reason="no LCMF measurement",
             )
+        elif measurement.accepted and (withheld := iwr6843_launch_withheld_reason(measurement)):
+            # The horizontal proxy rides the same range track, so it is
+            # withheld with the vertical angle rather than published alone.
+            logger.warning(
+                "[SERVER] IWR6843 LCMF-v1 %.2f° withheld (%s); using estimate",
+                measurement.angle_deg,
+                withheld,
+            )
+            _emit_iwr6843_trigger_status(shot, state="rejected", reason=withheld)
         elif measurement.accepted:
             shot.launch_angle_vertical = measurement.angle_deg
             # Device-level provenance is retained in iwr6843_capture. The
