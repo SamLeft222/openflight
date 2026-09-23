@@ -27,7 +27,7 @@ from openflight.clubs import ClubType
 from openflight.launch_monitor import Shot
 
 
-def _measurement(*, angle, status="accepted", single_channel=False, horizontal=None):
+def _measurement(*, angle, status="accepted", single_channel=False, horizontal=None, n_frames=12):
     return SimpleNamespace(
         accepted=True,
         status=status,
@@ -37,13 +37,13 @@ def _measurement(*, angle, status="accepted", single_channel=False, horizontal=N
         horizontal_confidence=0.9 if horizontal is not None else None,
         horizontal_status="hlcmf_v1_accepted" if horizontal is not None else None,
         n_snapshots=40,
-        n_frames=12,
+        n_frames=n_frames,
         component_std_deg=0.0,
         to_dict=lambda: {"estimator": "lcmf_v1", "status": status, "launch_angle_deg": angle},
     )
 
 
-def _run(monkeypatch, measurement):
+def _run(monkeypatch, measurement, *, profile_id="", club=ClubType.IRON_9):
     emitted = []
     capture = SimpleNamespace(
         trigger_timestamp=100.01,
@@ -67,7 +67,8 @@ def _run(monkeypatch, measurement):
         club_speed_mph=76.0,
         timestamp=datetime.now(),
         impact_timestamp=100.0,
-        club=ClubType.IRON_9,
+        club=club,
+        profile_id=profile_id,
     )
     server_module._process_iwr6843_angle(shot)
     return shot, emitted
