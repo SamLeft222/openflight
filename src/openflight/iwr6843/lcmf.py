@@ -53,10 +53,6 @@ HORIZONTAL_COHERENCE_MIN = 0.90
 # gap: agreeing channels spread 4.59 deg, collapsed ones 15.9-20.2 deg
 # (2026-07-25 session 140533).
 CHANNEL_SPREAD_MAX_DEG = 8.0
-# Launch-angle search grid for every channel. A channel whose minimum sits on
-# either edge did not measure anything (see ``grid_curvature``).
-GRID_MIN_DEG = -5.0
-GRID_MAX_DEG = 45.0
 
 # A single-channel estimate has no cross-check. 0.7 keeps it above the
 # fallback-estimate confidence of 0.5 while marking it weaker than a
@@ -888,7 +884,7 @@ def estimate_lcmf_v1(
             "tx_order": tx_order,
             "tdm_tau_s": tdm_tau_s,
         }
-        grid_deg = np.arange(GRID_MIN_DEG, GRID_MAX_DEG + grid_step_deg / 2.0, grid_step_deg)
+        grid_deg = np.arange(-5.0, 45.0 + grid_step_deg / 2.0, grid_step_deg)
         channel_components, channel_evidence = _channel_estimates(
             cache, indices, model_geometry, grid_deg
         )
