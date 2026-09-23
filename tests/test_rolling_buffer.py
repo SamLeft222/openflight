@@ -976,6 +976,35 @@ class TestRollingBufferMonitorSpinPlausibility:
         assert shot.impact_timestamp == pytest.approx(12345.678)
         assert shot.impact_timestamp_kld7 == pytest.approx(12345.678)
 
+    def test_create_shot_leaves_carry_to_server_finalization(self):
+        """A clean, plausible spin must not pre-fill carry_spin_adjusted.
+
+        Carry is committed once, in server finalization, so the ballistic
+        simulator is never short-circuited by a table estimate written here.
+        """
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="sound")
+        monitor.set_club(ClubType.IRON_7)
+        processed = self._processed_with_spin(
+            SpinResult(
+                spin_rpm=6200,
+                confidence=0.8,
+                snr=12.0,
+                quality="high",
+                peak_freq_hz=103.3,
+                seam_cycles=4.0,
+                at_lower_rail=False,
+            )
+        )
+
+        shot = monitor._create_shot(processed)
+
+        assert shot is not None
+        assert shot.spin_rpm == 6200
+        assert shot.spin_rejection_reason is None
+        assert shot.carry_spin_adjusted is None
+
     def test_lower_rail_driver_spin_kept_diagnostic_only(self):
         """Rail picks should be logged but not exposed as measured spin."""
         from openflight.rolling_buffer import RollingBufferMonitor

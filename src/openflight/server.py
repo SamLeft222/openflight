@@ -31,7 +31,7 @@ from .clubs.physics import (
     get_club_physics,
     get_club_simulation_profile,
 )
-from .launch_monitor import SPIN_CONFIDENCE_HIGH, Shot, summarize_shots
+from .launch_monitor import SPIN_CONFIDENCE_HIGH, SPIN_CONFIDENCE_RELIABLE, Shot, summarize_shots
 from .ops243 import (
     UART_BAUD_COMMANDS,
     Direction,
@@ -3196,9 +3196,9 @@ def _finalize_shot_detected(
     # Compute carry. Prefer the physics simulator (drag + Magnus, RK4) when
     # ballistics is enabled and a vertical launch angle is available; fall
     # back to the table estimator otherwise (either ballistics disabled or
-    # angle missing → resolve_launch returns None).
-    _MIN_RELIABLE_SPIN_CONF = 0.6
-    if shot.carry_spin_adjusted is None and shot.mode != "mock":
+    # angle missing → resolve_launch returns None). This is the only place
+    # that writes carry_spin_adjusted for a live shot.
+    if shot.mode != "mock":
         conditions = resolve_launch(shot) if ballistics_enabled else None
         if conditions is not None:
             trajectory = simulate(conditions)
@@ -3214,7 +3214,7 @@ def _finalize_shot_detected(
                 shot.spin_rpm
                 and shot.spin_rpm > 0
                 and shot.spin_confidence is not None
-                and shot.spin_confidence >= _MIN_RELIABLE_SPIN_CONF
+                and shot.spin_confidence >= SPIN_CONFIDENCE_RELIABLE
             )
             spin_for_carry = (
                 shot.spin_rpm

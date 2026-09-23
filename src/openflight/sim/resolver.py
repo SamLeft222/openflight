@@ -103,7 +103,13 @@ def resolve_shot(shot: Shot, player_state: PlayerState) -> ResolvedShot:
     provenance["back_spin"] = derived_prov
     provenance["side_spin"] = derived_prov
 
-    carry = float(shot.estimated_carry_yards)
+    # carry_spin_adjusted holds the server's committed carry (ballistic
+    # simulator, or the spin table when the simulator cannot run). The bare
+    # launch-angle table is only for shots that never went through finalization.
+    if shot.carry_spin_adjusted is not None:
+        carry = float(shot.carry_spin_adjusted)
+    else:
+        carry = float(shot.estimated_carry_yards)
     # Carry is always model-derived (never directly observed), so "measured" here
     # means launch-angle-informed: the carry model was driven by a measured launch
     # angle rather than falling back to club-type defaults. The UI badge reflects

@@ -18,6 +18,10 @@ from .ops243 import SpeedReading
 # Measured spin is trusted for physics simulation only above this level.
 SPIN_CONFIDENCE_HIGH = 0.7
 
+# Floor below which a measured spin is diagnostic only: it is still reported,
+# but the carry table substitutes the club-optimal spin for the ball speed.
+SPIN_CONFIDENCE_RELIABLE = 0.6
+
 
 def estimate_carry_distance(ball_speed_mph: float, club: ClubType = ClubType.DRIVER) -> float:
     """

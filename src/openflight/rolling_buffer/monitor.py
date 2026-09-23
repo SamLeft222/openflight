@@ -799,15 +799,6 @@ class RollingBufferMonitor:
                 "%.0f" % spin.spin_rpm if spin else "N/A",
             )
 
-        # Calculate carry distance.
-        # Use spin-adjusted carry only for reliable, plausible spin readings.
-        has_reliable_spin = bool(
-            processed.has_spin
-            and club_spin_rejection_reason is None
-            and spin is not None
-            and not spin.at_lower_rail
-            and not spin.at_upper_rail
-        )
         has_reportable_spin = bool(
             spin is not None
             and spin.spin_rpm > 0
@@ -835,16 +826,6 @@ class RollingBufferMonitor:
                 spin_rejection_reason = (
                     f"Upper-rail spin candidate {spin.spin_rpm:.0f} RPM kept as diagnostic only"
                 )
-
-        if has_reliable_spin:
-            carry = estimate_carry_with_spin(
-                processed.ball_speed_mph,
-                spin.spin_rpm,
-                self._current_club,
-                club_speed_mph=processed.club_speed_mph,
-            )
-        else:
-            carry = estimate_carry_distance(processed.ball_speed_mph, self._current_club)
 
         spin_rpm = spin.spin_rpm if has_reportable_spin else None
         spin_confidence = spin.confidence if has_reportable_spin else None
@@ -881,7 +862,6 @@ class RollingBufferMonitor:
             spin_phase_agreement_pct=spin.phase_agreement_pct if spin else None,
             spin_phase_confirmed=spin.phase_confirmed if spin else False,
             spin_rejection_reason=spin_rejection_reason,
-            carry_spin_adjusted=carry if has_reliable_spin else None,
             mode="rolling-buffer",
         )
 

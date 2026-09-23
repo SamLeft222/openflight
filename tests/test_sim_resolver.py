@@ -110,3 +110,15 @@ def test_shot_number_uses_player_state():
     ps.next_shot_number()  # consume one
     r = resolve_shot(_shot(spin_rpm=2500.0, spin_confidence=0.9), ps)
     assert r.shot_number == 2
+
+
+def test_carry_prefers_committed_spin_adjusted_carry():
+    shot = _shot(launch_angle_vertical=12.0, carry_spin_adjusted=244.0)
+    assert resolve_shot(shot, PlayerState()).carry_yards == pytest.approx(244.0)
+
+
+def test_carry_falls_back_to_table_when_nothing_committed():
+    shot = _shot(launch_angle_vertical=12.0)
+    assert resolve_shot(shot, PlayerState()).carry_yards == pytest.approx(
+        shot.estimated_carry_yards
+    )
