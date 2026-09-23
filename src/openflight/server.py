@@ -2338,6 +2338,55 @@ def iwr6843_launch_withheld_reason(measurement) -> str | None:
     return None
 
 
+# A single-channel result whose floor-reflection channel (two8) reads at or
+# below this is treated as a topped ball; see ``iwr6843_low_launch_deg``.
+LOW_LAUNCH_TWO8_MAX_DEG = 5.0
+# Floor for that reading: two8 goes negative on tops, and the ballistic model
+# carries any launch <= 0 exactly 0 yd. The R10 reported 2.0-4.3 deg on them.
+LOW_LAUNCH_FLOOR_DEG = 2.0
+LOW_LAUNCH_STATUS = "accepted_low_launch_two8"
+
+
+def iwr6843_low_launch_deg(measurement) -> float | None:
+    """Launch angle for a topped ball the channel combiner could not settle.
+
+    When the two LCMF channels disagree, ``combine_channels`` keeps the better
+    conditioned one and the result is withheld as single-channel. Paired R10
+    sessions (2026-09-23, 69 shots) showed that when the floor-reflection
+    channel (two8) of such a result reads <= LOW_LAUNCH_TWO8_MAX_DEG, the
+    ball was topped every time (6 of 6, R10 2.0-4.3 deg): a ball skimming the
+    floor sits on its own mirror image, which only two8 models. The fallback
+    estimate assumes a clean strike (16-28 deg) and carried those ~95 yd
+    instead of 20-35 yd.
+
+    Returns ``max(two8, LOW_LAUNCH_FLOOR_DEG)`` for that shape, else ``None``.
+    Not rescued:
+
+    * two-channel results -- the normal path already handles them;
+    * OPS-incompatible tracks (``accepted_track_speed_warning``);
+    * a two8 on the grid floor, or a four4 on the grid ceiling -- an edge
+      value is not a measurement, and a genuine >45 deg wedge also pins four4.
+    """
+    from .iwr6843.lcmf import (  # pylint: disable=import-outside-toplevel
+        ANGLE_CORRECTION_DEG,
+        GRID_MAX_DEG,
+        GRID_MIN_DEG,
+    )
+
+    if not getattr(measurement, "single_channel", False):
+        return None
+    if getattr(measurement, "status", None) == "accepted_track_speed_warning":
+        return None
+    components = getattr(measurement, "components_deg", None) or {}
+    two8 = components.get("channel_two8_deg")
+    four4 = components.get("channel_four4_path_tdm_deg")
+    if two8 is None or four4 is None:
+        return None
+    if not GRID_MIN_DEG < two8 <= LOW_LAUNCH_TWO8_MAX_DEG or four4 >= GRID_MAX_DEG:
+        return None
+    return max(float(two8) + ANGLE_CORRECTION_DEG, LOW_LAUNCH_FLOOR_DEG)
+
+
 def vertical_confidence(measurement) -> float:
     """Vertical launch confidence from channel agreement and corroboration.
 
@@ -2488,7 +2537,11 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
                 state="rejected",
                 reason="no LCMF measurement",
             )
-        elif measurement.accepted and (withheld := iwr6843_launch_withheld_reason(measurement)):
+        elif (
+            measurement.accepted
+            and (low_launch_deg := iwr6843_low_launch_deg(measurement)) is None
+            and (withheld := iwr6843_launch_withheld_reason(measurement))
+        ):
             # The horizontal proxy rides the same range track, so it is
             # withheld with the vertical angle rather than published alone.
             logger.warning(
@@ -2498,7 +2551,17 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
             )
             _emit_iwr6843_trigger_status(shot, state="rejected", reason=withheld)
         elif measurement.accepted:
-            shot.launch_angle_vertical = measurement.angle_deg
+            if low_launch_deg is None:
+                launch_deg, accepted_reason = measurement.angle_deg, "accepted"
+            else:
+                launch_deg, accepted_reason = low_launch_deg, LOW_LAUNCH_STATUS
+                logger.warning(
+                    "[SERVER] IWR6843 single-channel %.2f° replaced by low two8 launch "
+                    "%.2f° (likely topped ball)",
+                    measurement.angle_deg,
+                    launch_deg,
+                )
+            shot.launch_angle_vertical = launch_deg
             # Device-level provenance is retained in iwr6843_capture. The
             # public Shot contract uses "radar" for all measured radar angles.
             shot.launch_angle_vertical_source = "radar"
@@ -2525,7 +2588,7 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
             logger.info(
                 "[SERVER] IWR6843 LCMF-v1 launch: %.2f° "
                 "(%d snapshots/%d frames, component std %.2f°)",
-                measurement.angle_deg,
+                launch_deg,
                 measurement.n_snapshots,
                 measurement.n_frames,
                 measurement.component_std_deg,
@@ -2533,8 +2596,8 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
             _emit_iwr6843_trigger_status(
                 shot,
                 state="accepted",
-                reason="accepted",
-                angle_deg=measurement.angle_deg,
+                reason=accepted_reason,
+                angle_deg=launch_deg,
             )
         else:
             logger.warning(

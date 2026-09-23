@@ -27,7 +27,9 @@ from openflight.clubs import ClubType
 from openflight.launch_monitor import Shot
 
 
-def _measurement(*, angle, status="accepted", single_channel=False, horizontal=None):
+def _measurement(
+    *, angle, status="accepted", single_channel=False, horizontal=None, components=None
+):
     return SimpleNamespace(
         accepted=True,
         status=status,
@@ -39,6 +41,7 @@ def _measurement(*, angle, status="accepted", single_channel=False, horizontal=N
         n_snapshots=40,
         n_frames=12,
         component_std_deg=0.0,
+        components_deg=components if components is not None else {},
         to_dict=lambda: {"estimator": "lcmf_v1", "status": status, "launch_angle_deg": angle},
     )
 
@@ -176,3 +179,100 @@ def test_measurement_without_gate_fields_is_applied(monkeypatch):
 
     assert shot.launch_angle_vertical == pytest.approx(17.4)
     assert shot.launch_angle_vertical_source == "radar"
+
+
+# --- Low-launch (topped ball) rescue ---------------------------------------
+#
+# Field report (2026-09-23, 69 shots paired with the R10 over three sessions):
+# single-channel results whose two channels disagreed with the floor-reflection
+# channel (two8) reading <= 5 deg were tops every time (6 of 6, R10 2.0-4.3 deg).
+# Withholding them fell back to the clean-strike estimate (16-28 deg) and
+# carried a 20-35 yd top ~95 yd. two8 now drives those shots, floored at 2 deg.
+
+
+def _two_channel(two8, four4, *, used="four4_path_tdm", status="accepted", horizontal=None):
+    components = {"channel_two8_deg": two8, "channel_four4_path_tdm_deg": four4}
+    return _measurement(
+        angle=components[f"channel_{used}_deg"],
+        status=status,
+        single_channel=True,
+        horizontal=horizontal,
+        components=components,
+    )
+
+
+@pytest.mark.parametrize(
+    "two8, four4, expected",
+    [
+        (3.1, 12.2, 3.1),  # 4-iron, R10 4.3
+        (-3.2, 7.8, 2.0),  # driver, R10 2.0 (floored)
+        (-3.9, 8.3, 2.0),  # driver, R10 2.0 (floored)
+        (1.9, 14.0, 2.0),  # driver, R10 2.1 (floored)
+        (4.3, 23.4, 4.3),  # driver, R10 3.1
+        (-1.4, 10.8, 2.0),  # lob wedge, R10 3.0 (floored)
+        (5.0, 13.0, 5.0),  # boundary: 5.0 deg is still "low"
+    ],
+)
+def test_single_channel_with_low_two8_applies_two8(monkeypatch, two8, four4, expected):
+    shot, emitted = _run(monkeypatch, _two_channel(two8, four4))
+
+    assert shot.launch_angle_vertical == pytest.approx(expected)
+    assert shot.launch_angle_vertical_source == "radar"
+    assert _iwr_status(emitted) == {
+        "state": "accepted",
+        "reason": "accepted_low_launch_two8",
+        "angle_deg": pytest.approx(expected),
+    }
+
+
+@pytest.mark.parametrize(
+    "measurement, reason",
+    [
+        # 6-iron, R10 18.2: two8 6.6 is above the low-launch cutoff.
+        (_two_channel(6.6, 16.8), "withheld_single_channel"),
+        # Just above the boundary.
+        (_two_channel(5.01, 13.0), "withheld_single_channel"),
+        # four4 pinned at the 45 deg grid ceiling: no usable second reading
+        # (R10 2-9 deg on 6 of 6, but a genuine >45 deg wedge pins it too).
+        (_two_channel(3.0, 45.0, used="two8"), "withheld_single_channel"),
+        # two8 pinned at the -5 deg grid floor is not a measurement
+        # (lob wedge, R10 32.8, four4 37.9).
+        (_two_channel(-5.0, 37.9), "withheld_single_channel"),
+        # A wrong (OPS-incompatible) track stays withheld even with a low two8.
+        (
+            _two_channel(4.0, 15.6, status="accepted_track_speed_warning"),
+            "withheld_single_channel",
+        ),
+        # Single channel without per-channel diagnostics.
+        (
+            _measurement(angle=19.0, single_channel=True),
+            "withheld_single_channel",
+        ),
+    ],
+)
+def test_single_channel_without_low_two8_evidence_stays_withheld(monkeypatch, measurement, reason):
+    shot, emitted = _run(monkeypatch, measurement)
+
+    assert shot.launch_angle_vertical is None
+    assert _iwr_status(emitted) == {"state": "rejected", "reason": reason}
+
+
+def test_two_channel_result_is_not_rewritten_by_low_two8(monkeypatch):
+    """Only the single-channel disagreement case uses two8 on its own."""
+    measurement = _measurement(
+        angle=4.1,
+        status="accepted_ops_guided",
+        components={"channel_two8_deg": 4.0, "channel_four4_path_tdm_deg": 4.2},
+    )
+    shot, emitted = _run(monkeypatch, measurement)
+
+    assert shot.launch_angle_vertical == pytest.approx(4.1)
+    assert _iwr_status(emitted)["reason"] == "accepted"
+
+
+def test_low_launch_rescue_keeps_the_track_horizontal(monkeypatch):
+    """The track is OPS-compatible; only the vertical channel choice changes."""
+    shot, _ = _run(monkeypatch, _two_channel(-3.2, 7.8, horizontal=-4.5))
+
+    assert shot.launch_angle_horizontal == pytest.approx(-4.5)
+    assert shot.launch_angle_horizontal_source == "radar"
