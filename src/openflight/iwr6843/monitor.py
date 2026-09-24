@@ -15,10 +15,14 @@ from typing import Callable
 from openflight.gpio_factory import ensure_lgpio_pin_factory
 from openflight.iwr6843.driver import IWR6843Radar
 from openflight.iwr6843.dump import HEADER, parse_header, payload_nbytes
+from openflight.iwr6843.reduced import StripRequest, parse_overview
 
 logger = logging.getLogger(__name__)
 
 _GRACEFUL_DUMP_SHUTDOWN_S = 12.0
+# A held reduced-transfer capture nobody finishes is released after this long:
+# under the firmware's own 10 s timeout, so the Pi's state never disagrees.
+DEFAULT_HOLD_BUDGET_S = 8.0
 
 
 def tx_order_from_config(config_path: str | Path) -> str:
@@ -40,7 +44,13 @@ def tx_order_from_config(config_path: str | Path) -> str:
 
 @dataclass(frozen=True)
 class IWR6843Capture:
-    """One GPIO edge and its completed L3 dump."""
+    """One GPIO edge and its completed L3 dump, or its reduced-transfer overview.
+
+    ``transfer`` is "full" (``raw`` holds the dump) or "reduced" (``overview``
+    holds the overview, and the radar holds the frozen ring until
+    ``IWR6843CaptureMonitor.finish_capture``). ``fallback_reason`` says why a
+    reduced-mode monitor fell back to a full dump.
+    """
 
     sequence: int
     trigger_timestamp: float
@@ -50,11 +60,23 @@ class IWR6843Capture:
     path: Path | None
     error: str | None = None
     temperature_report: dict[str, int] | None = None
+    overview: bytes | None = None
+    transfer: str = "full"
+    fallback_reason: str | None = None
 
     @property
     def valid(self) -> bool:
-        """Whether a complete dump was captured."""
-        return self.raw is not None and self.error is None
+        """Whether a complete dump or overview was captured."""
+        return (self.raw is not None or self.overview is not None) and self.error is None
+
+
+@dataclass
+class _Hold:
+    """The capture whose frozen ring the radar is holding."""
+
+    sequence: int
+    done: threading.Event
+    finished: bool = False
 
 
 class IWR6843CaptureMonitor:
@@ -77,6 +99,8 @@ class IWR6843CaptureMonitor:
         match_tolerance_s: float = 0.75,
         save_dumps: bool = False,
         trigger_observers: list[Callable[[float], None]] | None = None,
+        reduced_gate: tuple[int, int] | None = None,
+        hold_budget_s: float = DEFAULT_HOLD_BUDGET_S,
     ):
         self.config_path = Path(config_path)
         self.output_dir = Path(output_dir).expanduser()
@@ -96,6 +120,13 @@ class IWR6843CaptureMonitor:
         self._condition = threading.Condition()
         self._worker: threading.Thread | None = None
         self._trigger_observers = list(trigger_observers or [])
+        # Reduced transfer (plans/iwr6843-on-chip-reduction.md): None keeps the
+        # classic full dump. All radar I/O while a ring is held goes through
+        # _serial_lock; _hold names the held capture.
+        self.reduced_gate = reduced_gate
+        self.hold_budget_s = hold_budget_s
+        self._serial_lock = threading.Lock()
+        self._hold: _Hold | None = None
 
     @property
     def port(self) -> str:
@@ -114,6 +145,17 @@ class IWR6843CaptureMonitor:
         try:
             self.radar.send_config(str(self.config_path))
             configured = True
+            if self.reduced_gate is not None:
+                try:
+                    self.radar.configure_overview_gate(self.reduced_gate)
+                except RuntimeError as exc:
+                    # Released firmware has no overviewCfg: keep the radar
+                    # working with full dumps rather than failing the IWR.
+                    logger.warning(
+                        "[IWR6843] Firmware lacks the reduced transfer (%s); using full dumps",
+                        exc,
+                    )
+                    self.reduced_gate = None
 
             button_factory = self._button_factory
             if button_factory is None:
@@ -200,9 +242,110 @@ class IWR6843CaptureMonitor:
             raise ValueError(f"short IWR6843 dump: {len(raw)} bytes, expected {expected}")
         return metadata
 
-    def _capture_path(self, sequence: int, trigger_timestamp: float) -> Path:
+    def _capture_path(
+        self, sequence: int, trigger_timestamp: float, suffix: str = ".l3dump"
+    ) -> Path:
         timestamp = datetime.fromtimestamp(trigger_timestamp).strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        return self.output_dir / f"iwr6843_{timestamp}_{sequence:03d}.l3dump"
+        return self.output_dir / f"iwr6843_{timestamp}_{sequence:03d}{suffix}"
+
+    def _read_full(self, sequence: int, edge_timestamp: float) -> tuple[bytes, Path | None, dict]:
+        """One ordinary dump (or the held ring streamed whole), validated and saved."""
+        raw = self.radar.read_dump()
+        metadata = self._validate_dump(raw)
+        path = None
+        if self.save_dumps:
+            path = self._capture_path(sequence, edge_timestamp)
+            path.write_bytes(raw)
+        return raw, path, metadata
+
+    def _read_reduced(self, sequence: int, edge_timestamp: float) -> dict:
+        """The overview, holding the ring -- or an ordinary dump if that fails."""
+        try:
+            overview = self.radar.read_overview()
+            metadata = parse_overview(overview).metadata
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "[IWR6843] Overview #%d failed (%s); falling back to a full dump",
+                sequence,
+                exc,
+            )
+            try:
+                self.radar.release()
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning("[IWR6843] Release before fallback failed", exc_info=True)
+            raw, path, metadata = self._read_full(sequence, edge_timestamp)
+            return {"raw": raw, "path": path, "metadata": metadata, "fallback_reason": str(exc)}
+        path = None
+        if self.save_dumps:
+            path = self._capture_path(sequence, edge_timestamp, ".overview")
+            path.write_bytes(overview)
+        with self._serial_lock:
+            self._hold = _Hold(sequence=sequence, done=threading.Event())
+        return {"overview": overview, "path": path, "metadata": metadata, "transfer": "reduced"}
+
+    def read_strips(self, capture: IWR6843Capture, request: StripRequest) -> bytes:
+        """Strips of a held capture's frozen ring."""
+        with self._serial_lock:
+            if not self._holding(capture):
+                raise RuntimeError(f"IWR6843 capture #{capture.sequence} is no longer held")
+            return self.radar.read_strips(request)
+
+    def finish_capture(self, capture: IWR6843Capture, *, full_dump: bool) -> bytes | None:
+        """Let a reduced-transfer capture go; returns the full dump when asked for.
+
+        ``full_dump`` streams the held ring whole (and the firmware resumes);
+        otherwise the ring is released. A full-transfer capture returns its
+        dump. Finishing a capture that is no longer held returns None.
+        """
+        if capture.transfer != "reduced":
+            return capture.raw
+        with self._serial_lock:
+            if not self._holding(capture):
+                return None
+            hold = self._hold
+            try:
+                if full_dump:
+                    raw, _path, _metadata = self._read_full(
+                        capture.sequence, capture.trigger_timestamp
+                    )
+                    return raw
+                self.radar.release()
+                return None
+            finally:
+                self._end_hold(hold)
+
+    def _holding(self, capture: IWR6843Capture) -> bool:
+        hold = self._hold
+        return hold is not None and hold.sequence == capture.sequence and not hold.finished
+
+    def _end_hold(self, hold: _Hold) -> None:
+        """Mark a hold over; the caller holds _serial_lock."""
+        hold.finished = True
+        if self._hold is hold:
+            self._hold = None
+        hold.done.set()
+
+    def _await_finish(self, sequence: int) -> None:
+        """Block new edges until the held capture is finished or its budget runs out."""
+        hold = self._hold
+        if hold is None or hold.sequence != sequence:
+            return
+        if hold.done.wait(self.hold_budget_s):
+            return
+        with self._serial_lock:
+            if hold.finished:
+                return
+            logger.warning(
+                "[IWR6843] Capture #%d was not finished within %.1fs; releasing the radar",
+                sequence,
+                self.hold_budget_s,
+            )
+            try:
+                self.radar.release()
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning("[IWR6843] Release of abandoned capture failed", exc_info=True)
+            finally:
+                self._end_hold(hold)
 
     def _capture_loop(self) -> None:
         while self._running:
@@ -218,20 +361,26 @@ class IWR6843CaptureMonitor:
             path = None
             error = None
             metadata = None
+            result: dict = {}
             try:
                 logger.info(
-                    "[IWR6843] Trigger #%d: dumping firmware-frozen L3 ring",
+                    "[IWR6843] Trigger #%d: %s",
                     sequence,
+                    "fetching the overview of the frozen L3 ring"
+                    if self.reduced_gate is not None
+                    else "dumping firmware-frozen L3 ring",
                 )
-                raw = self.radar.read_dump()
-                metadata = self._validate_dump(raw)
-                if self.save_dumps:
-                    path = self._capture_path(sequence, edge_timestamp)
-                    path.write_bytes(raw)
+                if self.reduced_gate is not None:
+                    result = self._read_reduced(sequence, edge_timestamp)
+                else:
+                    raw, path, metadata = self._read_full(sequence, edge_timestamp)
+                    result = {"raw": raw, "path": path, "metadata": metadata}
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 error = str(exc)
-                raw = None
                 logger.warning("[IWR6843] Capture #%d failed: %s", sequence, exc, exc_info=True)
+            raw = result.get("raw")
+            path = result.get("path")
+            metadata = result.get("metadata")
             completed = time.time()
             capture = IWR6843Capture(
                 sequence=sequence,
@@ -244,15 +393,27 @@ class IWR6843CaptureMonitor:
                 temperature_report=(
                     metadata.get("temperature_report") if metadata is not None else None
                 ),
+                overview=result.get("overview"),
+                transfer=result.get("transfer", "full"),
+                fallback_reason=result.get("fallback_reason"),
             )
             with self._condition:
-                self._capture_active = False
                 self._captures.append(capture)
+                self._condition.notify_all()
+            # A held ring cannot capture another shot: keep new edges out until
+            # the runtime finishes this capture (or its budget runs out).
+            self._await_finish(sequence)
+            with self._condition:
+                self._capture_active = False
                 self._condition.notify_all()
             logger.info(
                 "[IWR6843] Capture #%d complete: %s in %.2fs",
                 sequence,
-                f"{len(raw)} bytes" if raw is not None else error,
+                f"{len(raw)} bytes"
+                if raw is not None
+                else f"overview {len(capture.overview)} bytes"
+                if capture.overview is not None
+                else error,
                 capture.dump_duration_s,
             )
 
@@ -323,6 +484,7 @@ class IWR6843CaptureMonitor:
             self._events.put_nowait(None)
         except queue.Full:
             pass
+        self._release_hold_for_shutdown()
         if self._worker is not None:
             # Preserve a complete debug dump and its trailing CLI prompt before
             # issuing sensorStop. Closing early strands firmware mid-transfer.
@@ -341,6 +503,18 @@ class IWR6843CaptureMonitor:
         else:
             self._stop_sensor_and_close()
         logger.info("[IWR6843] Capture monitor stopped")
+
+    def _release_hold_for_shutdown(self) -> None:
+        with self._serial_lock:
+            hold = self._hold
+            if hold is None or hold.finished:
+                return
+            try:
+                self.radar.release()
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning("[IWR6843] Release at shutdown failed", exc_info=True)
+            finally:
+                self._end_hold(hold)
 
     def _stop_sensor_and_close(self) -> None:
         """Best-effort firmware stop that never leaks the serial descriptor."""

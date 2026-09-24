@@ -37,7 +37,7 @@ from openflight.iwr6843.dump import (
     parse_dump,
 )
 from openflight.iwr6843.lcmf import TRACK_TIME_MARGIN_S, PreparedLCMFCapture, prepare_lcmf_capture
-from openflight.iwr6843.shot import TX2_LOOP_PERIOD_S, geometry_from_header
+from openflight.iwr6843.shot import RANGE_FFT_SIZE, TX2_LOOP_PERIOD_S, geometry_from_header
 from openflight.iwr6843.tracking import MTI_SCOPES, BallTrack, Geometry
 
 OVERVIEW_MAGIC = b"ILOV"
@@ -451,6 +451,14 @@ class CaptureReducedSource:
     def total_nbytes(self) -> int:
         """Everything sent for this shot."""
         return self.overview_nbytes + sum(self.strip_nbytes)
+
+
+def default_ball_gate(net_range_m: float | None) -> tuple[int, int]:
+    """The overview gate for range-snapshot captures, known before any capture."""
+    return tracking.ball_gate_bins(
+        tracking.RANGE_SPAN_M / RANGE_FFT_SIZE,
+        max_range_m=tracking.max_ball_range_m(net_range_m),
+    )
 
 
 def ball_gate_for(meta: dict, net_range_m: float | None) -> tuple[int, int]:

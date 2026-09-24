@@ -252,17 +252,31 @@ median, 2 for the power maps); sharing the two medians' passes would remove
 
 ## Phase 3: Host integration behind a flag
 
-### What to build
+### What was built
 
-`--iwr6843-reduced-transfer` in the IWR6843 monitor: overview, OPS-speed
-wait, track selection, strip requests, release. Falls back to `l3dump` on any
-failure. `--debug` can still request a full dump.
+* `--iwr6843-reduced-transfer`: on a trigger edge the capture monitor sends
+  `overviewCfg` (at start) and `l3overview`, and the radar holds its ring.
+  `IWR6843Runtime.process_shot` measures the held capture with
+  `measure_reduced`, fetching strips through `IWR6843CaptureMonitor.read_strips`
+  (one serial lock), then `finish_capture` releases the ring.
+* `--iwr6843-reduced-full-dump`: stream each held ring whole after measuring
+  (offline analysis, club path) at the full dump's time cost. Without it the
+  experimental club path is skipped (recorded in the transfer record).
+* Fallbacks, each tested: overview failure -> ordinary `l3dump`; any failure
+  of the reduced measurement -> the held ring streamed whole and measured as
+  today; released firmware without `overviewCfg` -> full dumps (the runtime
+  config reports the transfer actually in use); an unconsumed hold is
+  released after 8 s (the firmware's own timeout is 10 s); shutdown releases
+  a hold before `sensorStop`.
+* `iwr6843_capture` session entries carry a `transfer` record: mode, overview
+  bytes and seconds, strip bytes and seconds, fallback reason, full dump.
 
 ### Acceptance criteria
 
-- [ ] Per-stage timings (overview, strips, processing) in the session log.
-- [ ] Fallback to `l3dump` is exercised by tests for timeout, short reads, and
-      malformed responses.
+- [x] Per-stage timings (overview, strips, full dump) in the session log;
+      processing is the shot's existing `pipeline_ms.iwr6843`.
+- [x] Fallback to `l3dump` is exercised by tests for timeout, missing
+      responses, strip failures, measurement errors, and old firmware.
 - [ ] One R10-paired field session: IWR result latency and launch-angle error
       reported against the full-dump path.
 

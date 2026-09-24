@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
@@ -24,9 +25,12 @@ from openflight.iwr6843.recovery import (
     select_recovery_candidate,
 )
 from openflight.iwr6843.reduced import (
+    Overview,
     ReducedSource,
+    StripRequest,
     ball_gate_for,
     corridor_request,
+    parse_overview,
     prepare_reduced,
 )
 
@@ -114,6 +118,35 @@ class IWR6843ShotResult:
     capture: IWR6843Capture | None
     measurement: LCMFResult | None
     club_path: ClubPathResult | None = None
+    # How the TI data reached the Pi: mode ("full" or "reduced"), bytes and
+    # timings, any fallback reason, and whether a full dump was taken.
+    transfer: dict | None = None
+
+
+def _rounded_seconds(seconds: float | None) -> float | None:
+    return round(seconds, 3) if seconds is not None else None
+
+
+@dataclass
+class _HeldCaptureSource:
+    """A monitor-held reduced capture as a ReducedSource, counting its strips."""
+
+    monitor: IWR6843CaptureMonitor
+    capture: IWR6843Capture
+    strip_nbytes: list[int] = field(default_factory=list)
+    strip_seconds: list[float] = field(default_factory=list)
+
+    def overview(self) -> Overview:
+        """The capture's overview, as the radar sent it."""
+        return parse_overview(self.capture.overview)
+
+    def strips(self, request: StripRequest) -> bytes:
+        """Strips of the held ring, fetched through the monitor."""
+        start = time.monotonic()
+        response = self.monitor.read_strips(self.capture, request)
+        self.strip_seconds.append(round(time.monotonic() - start, 3))
+        self.strip_nbytes.append(len(response))
+        return response
 
 
 @dataclass
@@ -135,6 +168,9 @@ class IWR6843Runtime:
     # ball-departure timing. Applied to the club estimators only; the ball
     # pipeline keeps its own anchor.
     club_impact_correction_s: float = -0.002
+    # Reduced transfer: stream the held ring whole after each measurement (for
+    # offline analysis and club path), at the cost of the full dump's time.
+    reduced_full_dump: bool = False
     # Accepted ball tracks establish a truth-free rolling prior. A rejected
     # vertical solution may use that prior to recover impact timing for the
     # independent experimental club search, never to publish vertical launch.
@@ -384,23 +420,37 @@ class IWR6843Runtime:
             impact_timestamp,
             timeout_s=self.capture_timeout_s,
         )
-        if capture is None or not capture.valid or capture.raw is None:
+        if capture is None or not capture.valid:
             return IWR6843ShotResult(capture=capture, measurement=None)
         shot_calibration = self.calibration
         if tilt_deg is not None:
             shot_calibration = replace(self.calibration, tilt_rad=math.radians(tilt_deg))
-        measurement = self.measure_capture(
-            capture.raw,
-            ball_speed_mph=ball_speed_mph,
-            club=club,
-            calibration=shot_calibration,
-        )
+        if getattr(capture, "overview", None) is not None:
+            measurement, full_raw, transfer = self._measure_held_capture(
+                capture, shot_calibration, ball_speed_mph=ball_speed_mph, club=club
+            )
+        else:
+            measurement = self.measure_capture(
+                capture.raw,
+                ball_speed_mph=ball_speed_mph,
+                club=club,
+                calibration=shot_calibration,
+            )
+            full_raw = capture.raw
+            transfer = {
+                "mode": "full",
+                "dump_bytes": len(capture.raw),
+                "dump_s": _rounded_seconds(getattr(capture, "dump_duration_s", None)),
+                "fallback_reason": getattr(capture, "fallback_reason", None),
+            }
         self._remember_recovery_observation(measurement, ball_speed_mph)
         club_path = None
+        if club_speed_mph and full_raw is None:
+            transfer["club_path"] = "skipped: no full dump in reduced transfer"
         # No OPS club speed means no identity gate to distinguish the club
         # track from hands, body, or the ball itself, so an estimate here
         # would be an unverifiable guess -- worse than no estimate at all.
-        if club_speed_mph:
+        if club_speed_mph and full_raw is not None:
             ball_sign = getattr(measurement, "tdm_sign_used", None)
             fallback = ball_sign not in (-1, 1)
             policy_sign = _TDM_SIGN_BY_POLICY.get(self.tdm_sign_policy, 1)
@@ -408,7 +458,7 @@ class IWR6843Runtime:
             recovered_impact = False
             if impact_t_s is None:
                 impact_t_s = self._recover_impact_time(
-                    capture.raw,
+                    full_raw,
                     shot_calibration,
                     ball_speed_mph,
                 )
@@ -416,7 +466,7 @@ class IWR6843Runtime:
             if impact_t_s is not None:
                 impact_t_s += self.club_impact_correction_s
             club_path = estimate_club_path(
-                capture.raw,
+                full_raw,
                 shot_calibration,
                 ops_club_speed_mph=club_speed_mph,
                 # Where impact sits in the ring, from the ball's own range
@@ -437,7 +487,75 @@ class IWR6843Runtime:
                 # configured policy's guess, not a measured value. Recorded
                 # in the status so a later replay can tell the two apart.
                 club_path.status = f"{club_path.status}_tdm_sign_fallback"
-        return IWR6843ShotResult(capture=capture, measurement=measurement, club_path=club_path)
+        return IWR6843ShotResult(
+            capture=capture, measurement=measurement, club_path=club_path, transfer=transfer
+        )
+
+    def _measure_held_capture(
+        self,
+        capture: IWR6843Capture,
+        calibration: Calibration,
+        *,
+        ball_speed_mph: float,
+        club: str | None,
+    ) -> tuple[LCMFResult, bytes | None, dict]:
+        """Measure a held reduced capture; the capture is always finished.
+
+        If the reduced measurement fails for any reason, the held ring is
+        streamed whole and measured as today, so the shot is never lost.
+        """
+        source = _HeldCaptureSource(self.capture_monitor, capture)
+        transfer = {
+            "mode": "reduced",
+            "overview_bytes": len(capture.overview),
+            "overview_s": _rounded_seconds(capture.dump_duration_s),
+            "strip_bytes": source.strip_nbytes,
+            "strip_s": source.strip_seconds,
+            "fallback_reason": None,
+            "full_dump": False,
+        }
+        finished = False
+        try:
+            try:
+                measurement = self.measure_reduced(
+                    source, ball_speed_mph=ball_speed_mph, club=club, calibration=calibration
+                )
+            except Exception as error:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "[IWR6843] Reduced measurement of capture #%d failed (%s); "
+                    "measuring the held ring in full",
+                    capture.sequence,
+                    error,
+                )
+                transfer["fallback_reason"] = f"{type(error).__name__}: {error}"
+                full_raw = self._finish_held_capture(capture, transfer, full_dump=True)
+                finished = True
+                if full_raw is None:
+                    raise RuntimeError(
+                        f"IWR6843 capture #{capture.sequence} was released before its fallback"
+                    ) from error
+                measurement = self.measure_capture(
+                    full_raw, ball_speed_mph=ball_speed_mph, club=club, calibration=calibration
+                )
+                return measurement, full_raw, transfer
+            full_raw = self._finish_held_capture(
+                capture, transfer, full_dump=self.reduced_full_dump
+            )
+            finished = True
+            return measurement, full_raw, transfer
+        finally:
+            if not finished:
+                self.capture_monitor.finish_capture(capture, full_dump=False)
+
+    def _finish_held_capture(
+        self, capture: IWR6843Capture, transfer: dict, *, full_dump: bool
+    ) -> bytes | None:
+        start = time.monotonic()
+        full_raw = self.capture_monitor.finish_capture(capture, full_dump=full_dump)
+        transfer["full_dump"] = full_raw is not None
+        if full_raw is not None:
+            transfer["full_dump_s"] = round(time.monotonic() - start, 3)
+        return full_raw
 
     def stop(self) -> None:
         """Release TI hardware."""

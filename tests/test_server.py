@@ -602,6 +602,138 @@ class TestIWR6843ShotIntegration:
         assert server_module.iwr6843_runtime_config["horizontal_phase_reference_rad"] == -0.5
         server_module.iwr6843_runtime = None
 
+    @pytest.mark.parametrize("reduced_transfer", [False, True])
+    def test_init_iwr6843_wires_the_reduced_transfer(self, monkeypatch, tmp_path, reduced_transfer):
+        """plans/iwr6843-on-chip-reduction.md: the flag must reach monitor and runtime."""
+        from openflight.iwr6843 import reduced  # pylint: disable=import-outside-toplevel
+
+        captured = {}
+        calibration = Calibration.identity()
+
+        class FakeCaptureMonitor:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.port = "/dev/ttyUSB0"
+                self.reduced_gate = kwargs["reduced_gate"]
+
+            def start(self, *, armed=True):
+                return None
+
+            def stop(self):
+                return None
+
+        monkeypatch.setattr(Calibration, "load", lambda _path: calibration)
+        monkeypatch.setattr("openflight.iwr6843.monitor.IWR6843CaptureMonitor", FakeCaptureMonitor)
+        monkeypatch.setattr("openflight.iwr6843.monitor.tx_order_from_config", lambda _p: "normal")
+
+        assert server_module.init_iwr6843(
+            port="/dev/ttyUSB0",
+            config_path="snapshot.cfg",
+            calibration_path="cal.json",
+            output_dir=tmp_path,
+            trigger_pin=17,
+            tee_range_m=1.575,
+            net_range_m=4.6,
+            tx_order="auto",
+            capture_timeout_s=12.0,
+            reduced_transfer=reduced_transfer,
+            reduced_full_dump=reduced_transfer,
+        )
+
+        config = server_module.iwr6843_runtime_config
+        if reduced_transfer:
+            gate = reduced.default_ball_gate(4.6)
+            assert captured["reduced_gate"] == gate
+            assert server_module.iwr6843_runtime.reduced_full_dump is True
+            assert config["transfer"] == "reduced"
+            assert config["reduced_gate"] == list(gate)
+            assert config["reduced_full_dump"] is True
+        else:
+            assert captured["reduced_gate"] is None
+            assert server_module.iwr6843_runtime.reduced_full_dump is False
+            assert config["transfer"] == "full"
+        server_module.iwr6843_runtime = None
+
+    def test_config_reports_full_transfer_when_firmware_lacks_it(self, monkeypatch, tmp_path):
+        calibration = Calibration.identity()
+
+        class FallbackMonitor:
+            def __init__(self, **kwargs):
+                self.port = "/dev/ttyUSB0"
+                self.reduced_gate = kwargs["reduced_gate"]
+
+            def start(self, *, armed=True):
+                self.reduced_gate = None  # overviewCfg rejected by old firmware
+
+            def stop(self):
+                return None
+
+        monkeypatch.setattr(Calibration, "load", lambda _path: calibration)
+        monkeypatch.setattr("openflight.iwr6843.monitor.IWR6843CaptureMonitor", FallbackMonitor)
+        monkeypatch.setattr("openflight.iwr6843.monitor.tx_order_from_config", lambda _p: "normal")
+
+        assert server_module.init_iwr6843(
+            port="/dev/ttyUSB0",
+            config_path="snapshot.cfg",
+            calibration_path="cal.json",
+            output_dir=tmp_path,
+            trigger_pin=17,
+            tee_range_m=1.575,
+            net_range_m=4.6,
+            tx_order="auto",
+            capture_timeout_s=12.0,
+            reduced_transfer=True,
+        )
+
+        assert server_module.iwr6843_runtime_config["transfer"] == "full"
+        assert server_module.iwr6843_runtime_config["reduced_gate"] is None
+        server_module.iwr6843_runtime = None
+
+    def test_reduced_capture_logs_its_transfer(self, monkeypatch):
+        measurement = SimpleNamespace(
+            accepted=True,
+            angle_deg=12.0,
+            n_snapshots=20,
+            n_frames=10,
+            component_std_deg=0.5,
+            to_dict=lambda: {"estimator": "lcmf_v1"},
+        )
+        capture = SimpleNamespace(
+            trigger_timestamp=100.01,
+            path=None,
+            raw=None,
+            overview=b"o" * 100,
+            dump_duration_s=2.2,
+            error=None,
+            valid=True,
+            sequence=1,
+        )
+        transfer = {"mode": "reduced", "overview_bytes": 100, "strip_bytes": [30, 20]}
+        runtime = SimpleNamespace(
+            process_shot=lambda **kwargs: SimpleNamespace(
+                capture=capture, measurement=measurement, transfer=transfer
+            )
+        )
+        logged = []
+        session = SimpleNamespace(
+            stats={"shots_detected": 1},
+            log_iwr6843_capture=lambda **kwargs: logged.append(kwargs),
+        )
+        monkeypatch.setattr(server_module, "iwr6843_runtime", runtime)
+        monkeypatch.setattr(server_module, "get_session_logger", lambda: session)
+        monkeypatch.setattr(server_module.socketio, "emit", lambda *_args: None)
+        shot = Shot(
+            ball_speed_mph=100.0,
+            timestamp=datetime.now(),
+            impact_timestamp=100.0,
+            club=ClubType.IRON_9,
+        )
+
+        server_module._process_iwr6843_angle(shot)
+
+        assert logged[0]["capture_bytes"] == 150
+        assert logged[0]["transfer"] == transfer
+
     def test_accepted_lcmf_angle_is_applied_to_existing_shot_contract(self, monkeypatch):
         emitted = []
         measurement = SimpleNamespace(

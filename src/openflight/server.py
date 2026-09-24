@@ -1109,12 +1109,21 @@ def init_iwr6843(
     azimuth_offset_deg: float = 0.0,
     horizontal_phase_reference_rad: float | None = None,
     save_dumps: bool = False,
+    reduced_transfer: bool = False,
+    reduced_full_dump: bool = False,
 ) -> bool:
-    """Initialize GPIO-triggered TI capture and the frozen LCMF-v1 estimator."""
+    """Initialize GPIO-triggered TI capture and the frozen LCMF-v1 estimator.
+
+    ``reduced_transfer`` fetches an on-chip overview plus strips instead of the
+    whole capture (plans/iwr6843-on-chip-reduction.md; needs the reduced-
+    transfer firmware). ``reduced_full_dump`` also streams each held capture
+    whole afterwards, for offline analysis and club path.
+    """
     global iwr6843_runtime, iwr6843_runtime_config  # pylint: disable=global-statement
     try:
         from .iwr6843 import Calibration
         from .iwr6843.monitor import IWR6843CaptureMonitor, tx_order_from_config
+        from .iwr6843.reduced import default_ball_gate
         from .iwr6843.runtime import IWR6843Runtime
 
         configured_order = tx_order_from_config(config_path)
@@ -1133,12 +1142,14 @@ def init_iwr6843(
         if radar_height_m is not None:
             calibration.meta["radar_height_m"] = radar_height_m
 
+        reduced_gate = default_ball_gate(net_range_m) if reduced_transfer else None
         capture_monitor = IWR6843CaptureMonitor(
             config_path=config_path,
             output_dir=output_dir,
             port=port,
             gpio_pin=trigger_pin,
             save_dumps=save_dumps,
+            reduced_gate=reduced_gate,
             trigger_observers=(
                 [camera_capture_runtime.notify_trigger]
                 if camera_capture_runtime is not None
@@ -1160,7 +1171,9 @@ def init_iwr6843(
             # registration. Auto sign selection can choose the mirror solution
             # in multipath and collapse the eight-element vertical channel.
             tdm_sign_policy="positive",
+            reduced_full_dump=reduced_full_dump,
         )
+        active_gate = getattr(capture_monitor, "reduced_gate", None)
         iwr6843_runtime_config = {
             "enabled": True,
             "estimator": "lcmf_v1",
@@ -1181,6 +1194,10 @@ def init_iwr6843(
             "freeze_delay_ms": 0.0,
             "raw_dump_saved": save_dumps,
             "output_dir": str(Path(output_dir).expanduser()),
+            # What the monitor runs: old firmware falls back to full dumps.
+            "transfer": "reduced" if active_gate is not None else "full",
+            "reduced_gate": list(active_gate) if active_gate is not None else None,
+            "reduced_full_dump": reduced_full_dump,
         }
         logger.info(
             "[SERVER] IWR6843 initialized "
@@ -2393,6 +2410,17 @@ def _snapshot_inclinometer_for_shot(shot: Shot) -> None:
     shot.inclinometer = data
 
 
+def _iwr6843_capture_bytes(capture, transfer: dict | None) -> int:
+    """Bytes the radar sent for one shot: the full dump, or overview + strips."""
+    if capture is None:
+        return 0
+    if getattr(capture, "raw", None):
+        return len(capture.raw)
+    if transfer and transfer.get("mode") == "reduced":
+        return int(transfer.get("overview_bytes", 0)) + sum(transfer.get("strip_bytes", []))
+    return 0
+
+
 def _process_iwr6843_angle(shot: Shot) -> float | None:
     """Apply a correlated LCMF-v1 result without risking the OPS shot."""
     if iwr6843_runtime is None or shot.mode == "mock":
@@ -2423,7 +2451,9 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
                 shot_timestamp=shot.impact_timestamp,
                 trigger_timestamp=(capture.trigger_timestamp if capture is not None else None),
                 capture_path=(str(capture.path) if capture and capture.path else None),
-                capture_bytes=(len(capture.raw) if capture and capture.raw else 0),
+                capture_bytes=_iwr6843_capture_bytes(
+                    capture, getattr(shot_result, "transfer", None)
+                ),
                 dump_duration_s=(capture.dump_duration_s if capture is not None else None),
                 capture_error=(
                     capture.error
@@ -2436,6 +2466,7 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
                 temperature_report=(
                     getattr(capture, "temperature_report", None) if capture is not None else None
                 ),
+                transfer=getattr(shot_result, "transfer", None),
             )
 
         if capture is None:
@@ -4587,6 +4618,24 @@ def main():
         ),
     )
     parser.add_argument(
+        "--iwr6843-reduced-transfer",
+        action="store_true",
+        help=(
+            "Fetch an on-chip power overview plus strips of the TI capture instead "
+            "of the whole capture (~1 s instead of ~5 s; needs the reduced-transfer "
+            "firmware). Falls back to the full dump on any failure."
+        ),
+    )
+    parser.add_argument(
+        "--iwr6843-reduced-full-dump",
+        action="store_true",
+        help=(
+            "With --iwr6843-reduced-transfer, also stream each held capture whole "
+            "after measuring it (for offline analysis and club path; adds the full "
+            "dump's time before the radar can capture again)."
+        ),
+    )
+    parser.add_argument(
         "--iwr6843-output-dir",
         default=None,
         help=("Raw TI dump directory when --debug is enabled (default: <session-log-dir>/iwr6843)"),
@@ -4729,6 +4778,10 @@ def main():
         parser.error("--camera-capture cannot be used with --mock")
     if args.iwr6843 and (args.iwr6843_tee_m <= 0 or args.iwr6843_net_m <= 0):
         parser.error("--iwr6843-tee-m and --iwr6843-net-m must be positive")
+    if args.iwr6843_reduced_transfer and not args.iwr6843:
+        parser.error("--iwr6843-reduced-transfer requires --iwr6843")
+    if args.iwr6843_reduced_full_dump and not args.iwr6843_reduced_transfer:
+        parser.error("--iwr6843-reduced-full-dump requires --iwr6843-reduced-transfer")
     if args.camera_capture and (
         args.camera_capture_width <= 0
         or args.camera_capture_height <= 0
@@ -4907,6 +4960,8 @@ def main():
             azimuth_offset_deg=args.iwr6843_azimuth_offset_deg,
             horizontal_phase_reference_rad=args.iwr6843_horizontal_phase_reference_rad,
             save_dumps=args.debug,
+            reduced_transfer=args.iwr6843_reduced_transfer,
+            reduced_full_dump=args.iwr6843_reduced_full_dump,
         ):
             calibration = iwr6843_runtime.calibration
             ball_speed_correction_distance_ft = args.iwr6843_tee_m * 3.28084

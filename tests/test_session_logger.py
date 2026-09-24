@@ -456,6 +456,27 @@ class TestLogIWR6843Capture:
         assert entry["measurement"] == measurement
         assert entry["temperature_report"] == temperature_report
 
+    def test_iwr6843_capture_logs_its_transfer(self, tmp_path):
+        """Reduced-transfer bytes, timings, and fallbacks must be in the session log."""
+        logger = SessionLogger(log_dir=tmp_path, enabled=True)
+        logger.start_session(mode="rolling-buffer", trigger_type="sound")
+        transfer = {"mode": "reduced", "overview_bytes": 65244, "strip_bytes": [40000]}
+
+        logger.log_iwr6843_capture(
+            shot_number=1,
+            shot_timestamp=100.0,
+            trigger_timestamp=100.002,
+            capture_path=None,
+            capture_bytes=105244,
+            dump_duration_s=2.2,
+            capture_error=None,
+            ball_speed_mph=94.5,
+            transfer=transfer,
+        )
+
+        entry = json.loads(logger.session_path.read_text().strip().split("\n")[-1])
+        assert entry["transfer"] == transfer
+
     def test_iwr6843_capture_logs_club_path(self, tmp_path):
         """Club path evidence must be replayable from the session log alone."""
         logger = SessionLogger(log_dir=tmp_path, enabled=True)

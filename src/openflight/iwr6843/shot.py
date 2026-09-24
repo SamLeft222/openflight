@@ -23,6 +23,8 @@ from openflight.iwr6843.trajectory import TrajectoryFit
 
 DEFAULT_FRAME_PERIOD_S = 0.012  # header field is 0 on pre-v3 firmware dumps
 TX2_LOOP_PERIOD_S = 3 * doa.TDM_TAU_S
+# The HWA range FFT every range-snapshot capture's bins index into.
+RANGE_FFT_SIZE = 128
 
 # Two-ray configuration per club class, split-half TrackMan-scored on the
 # 2026-07-14 session (holdout MAE in comments). PROVISIONAL: one session of
@@ -326,7 +328,7 @@ def geometry_from_header(meta: dict, *, loop_period_s: float = tracking.LOOP_PRI
         trigger_frame=meta["trigger_frame"],
         loop_period_s=loop_period_s,
         range_bin_start=meta.get("range_bin_start", 0),
-        range_fft_size=128 if range_domain else None,
+        range_fft_size=RANGE_FFT_SIZE if range_domain else None,
         range_bin_starts=meta.get("range_bin_starts"),
         range_bin_counts=meta.get("range_bin_counts"),
         frame_time_offsets_s=(

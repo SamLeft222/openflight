@@ -380,8 +380,13 @@ class SessionLogger:
         measurement: Optional[Dict] = None,
         club_path: Optional[Dict] = None,
         temperature_report: Optional[Dict[str, Any]] = None,
+        transfer: Optional[Dict[str, Any]] = None,
     ):
-        """Log the TI raw-dump reference and complete LCMF evidence."""
+        """Log the TI raw-dump reference and complete LCMF evidence.
+
+        ``transfer`` records how the TI data reached the Pi (full dump or
+        reduced overview + strips, bytes, timings, fallbacks).
+        """
         if not self.enabled:
             return
         self._write_entry(
@@ -404,6 +409,7 @@ class SessionLogger:
                 "measurement": measurement,
                 "club_path": club_path,
                 "temperature_report": temperature_report,
+                "transfer": transfer,
             },
         )
 
