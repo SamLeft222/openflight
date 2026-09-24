@@ -81,10 +81,12 @@ def _compare_overview(checks: Checks, packed: bytes, full: bytes, gate) -> None:
         print(f"      {scope} power codes differing: {int(codes.sum())}")
 
 
-def run_cycle(checks: Checks, radar: IWR6843Radar, gate, out: Path | None, index: int) -> dict:
+def run_cycle(
+    checks: Checks, radar: IWR6843Radar, gate, out: Path | None, index: int, timeout_s: float
+) -> dict:
     timings = {}
     start = time.monotonic()
-    packed = radar.read_overview()
+    packed = radar.read_overview(timeout_s=timeout_s)
     timings["overview_s"] = time.monotonic() - start
     overview = reduced.parse_overview(packed)
     meta = overview.metadata
@@ -175,6 +177,12 @@ def main() -> int:
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--out", type=Path, default=None, help="Save every transfer here")
     parser.add_argument("--skip-timeout", action="store_true")
+    parser.add_argument(
+        "--overview-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for an overview (generous, so a slow build reports its timing)",
+    )
     args = parser.parse_args()
 
     checks = Checks()
@@ -195,7 +203,9 @@ def main() -> int:
         for index in range(args.cycles):
             print(f"Cycle {index + 1}/{args.cycles}")
             time.sleep(0.2)
-            all_timings.append(run_cycle(checks, radar, gate, args.out, index))
+            all_timings.append(
+                run_cycle(checks, radar, gate, args.out, index, args.overview_timeout)
+            )
         print("Release and error paths")
         check_release_and_errors(checks, radar, meta["n_frames"])
         if not args.skip_timeout:

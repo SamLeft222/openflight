@@ -184,7 +184,7 @@ installers are available.
 * `IWR6843Radar.configure_overview_gate / read_overview / read_strips /
   release` on the Pi; `scripts/hardware-test/test_iwr6843_reduced_transfer.py`
   for the on-radar check.
-* Candidate image: `firmware/candidates/l3_dump_reduced_transfer_rc2.bin`
+* Candidate image: `firmware/candidates/l3_dump_reduced_transfer_rc3.bin`
   (not the release until this phase passes on hardware).
 
 ### Hardware results
@@ -201,7 +201,21 @@ memory; burst MTI power is exactly s^2 |L c - sum c|^2 / L^2 and window power
 and Python still match byte-for-byte on all 80 captures). Against the float
 full-capture path: 0 status changes, launch angles within 3.4e-12 deg
 unquantised; accuracy vs the R10 unchanged. `stats` now also reports
-`prepare_ms` (compute only). Hardware timing pending.
+`prepare_ms` (compute only). On the radar the Pi received only the command
+echo: rc2 computes before its first byte, and the reader's 4 s stall timer
+counted from the echo. Either the compute exceeded 4 s or it hung -- the
+suspect is 64-bit integer multiplies and int64-to-double conversions, which
+the R4F runs as library calls.
+
+**rc3:** no 64-bit integers in the maths -- every intermediate is an exact
+integer below 2^53, so it is carried in doubles with bit-identical results
+(C and Python still match on all 80 captures). Compiling rc2's core with
+the TI toolchain confirmed the suspicion: it called `__aeabi_lmul` and
+`__aeabi_l2d` per value. rc3 calls neither, and the median's key is split
+into 32-bit halves so its per-value work needs no 64-bit shift helper
+either (those remain once per pass). The reader now starts its stall timer
+only once the response has begun, and reports a missing response instead
+of returning the echo. Hardware timing pending.
 
 ### Acceptance criteria
 

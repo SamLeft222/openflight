@@ -176,26 +176,28 @@ static double ro_burst_factor(const ro_capture_t *cap, uint32_t frame)
     return (double)(scale * scale) / (double)(loops * loops);
 }
 
-/* Exact |L c - sum c|^2 for one element of the loaded frame. */
-static int64_t ro_burst_residual(const ro_capture_t *cap, const ro_work_t *work,
-                                 uint32_t index, uint32_t pair, uint32_t rx, uint32_t bin)
+/* Exact |L c - sum c|^2 for one element of the loaded frame (< 2^53, so the
+ * double arithmetic is exact). */
+static double ro_burst_residual(const ro_capture_t *cap, const ro_work_t *work,
+                                uint32_t index, uint32_t pair, uint32_t rx, uint32_t bin)
 {
     int32_t loops = (int32_t)ro_loops(cap);
-    int32_t re = loops * work->code_re[index + bin] - work->sum_re[pair][rx][bin];
-    int32_t im = loops * work->code_im[index + bin] - work->sum_im[pair][rx][bin];
+    double re = (double)(loops * work->code_re[index + bin] - work->sum_re[pair][rx][bin]);
+    double im = (double)(loops * work->code_im[index + bin] - work->sum_im[pair][rx][bin]);
 
-    return (int64_t)re * re + (int64_t)im * im;
+    return re * re + im * im;
 }
 
-/* |n s c - T|^2 (rounded once) for one element; power is this times 1/n^2. */
+/* |n s c - T|^2 (rounded once) for one element; power is this times 1/n^2.
+ * n s c - T is an exact integer below 2^53. */
 static double ro_window_residual(const ro_work_t *work, uint32_t index, uint32_t pair,
                                  uint32_t rx, uint32_t bin, uint32_t absolute_bin,
-                                 int64_t n_scale)
+                                 double n_scale)
 {
-    double re = (double)(n_scale * work->code_re[index + bin] -
-                         work->total_re[pair][rx][absolute_bin]);
-    double im = (double)(n_scale * work->code_im[index + bin] -
-                         work->total_im[pair][rx][absolute_bin]);
+    double re = n_scale * (double)work->code_re[index + bin] -
+                work->total_re[pair][rx][absolute_bin];
+    double im = n_scale * (double)work->code_im[index + bin] -
+                work->total_im[pair][rx][absolute_bin];
 
     return re * re + im * im;
 }
@@ -211,14 +213,16 @@ static void ro_window_sums(const ro_capture_t *cap, ro_work_t *work)
     memset(work->total_count, 0, sizeof(work->total_count));
     for (frame = 0U; frame < cap->n_frames; frame++) {
         uint32_t start = cap->bin_start[frame];
-        int64_t scale = (int64_t)ro_scale(cap, frame);
+        double scale = (double)ro_scale(cap, frame);
 
         ro_load_frame(cap, work, frame);
         for (pair = 0U; pair < 2U; pair++) {
             for (rx = 0U; rx < cap->n_rx; rx++) {
                 for (bin = 0U; bin < cap->bin_count[frame]; bin++) {
-                    work->total_re[pair][rx][start + bin] += scale * work->sum_re[pair][rx][bin];
-                    work->total_im[pair][rx][start + bin] += scale * work->sum_im[pair][rx][bin];
+                    work->total_re[pair][rx][start + bin] +=
+                        scale * (double)work->sum_re[pair][rx][bin];
+                    work->total_im[pair][rx][start + bin] +=
+                        scale * (double)work->sum_im[pair][rx][bin];
                 }
             }
         }
@@ -234,6 +238,9 @@ static void ro_window_sums(const ro_capture_t *cap, ro_work_t *work)
 
 /* -- exact median: radix selection on the bits of non-negative doubles ---- */
 
+/* Non-negative doubles order like their bit patterns. The key is kept as two
+ * 32-bit halves: the R4F has no 64-bit shift by a variable amount, so the
+ * per-value work uses 32-bit shifts only (64-bit ones run once per pass). */
 static uint64_t ro_key(double value)
 {
     uint64_t key;
@@ -250,28 +257,71 @@ static double ro_from_key(uint64_t key)
     return value;
 }
 
+static uint32_t ro_mask(uint32_t width)
+{
+    return (width >= 32U) ? 0xFFFFFFFFU : ((1U << width) - 1U);
+}
+
+/* Bits [shift, shift + width) of the key hi:lo, width <= 32. */
+static uint32_t ro_field(uint32_t hi, uint32_t lo, uint32_t shift, uint32_t width)
+{
+    uint32_t value;
+
+    if (shift >= 32U) {
+        value = hi >> (shift - 32U);
+    } else if (shift == 0U) {
+        value = lo;
+    } else {
+        value = (lo >> shift) | (hi << (32U - shift));
+    }
+    return value & ro_mask(width);
+}
+
 typedef struct {
     ro_work_t *work;
-    uint64_t   prefix;       /* resolved high bits */
-    uint32_t   high_shift;   /* keys match when (key >> high_shift) == prefix */
-    uint32_t   shift;        /* digit being histogrammed */
+    uint64_t   prefix;        /* the resolved high bits of the key */
+    uint32_t   resolved;      /* how many high bits are resolved */
+    uint32_t   prefix_top;    /* the first min(resolved, 32) of them */
+    uint32_t   prefix_rest;   /* the rest (resolved > 32) */
+    uint32_t   shift;         /* digit being histogrammed */
     uint32_t   digit_mask;
-    uint32_t   collect;      /* 0: histogram the digit; 1: collect matching values */
+    uint32_t   collect;       /* 0: histogram the digit; 1: collect matching values */
     uint32_t   n_candidates;
 } ro_select_t;
+
+/* After s->prefix and s->resolved change: the 32-bit halves to compare. */
+static void ro_select_split_prefix(ro_select_t *s)
+{
+    if (s->resolved <= 32U) {
+        s->prefix_top = (uint32_t)s->prefix;
+        s->prefix_rest = 0U;
+    } else {
+        s->prefix_top = (uint32_t)(s->prefix >> (s->resolved - 32U));
+        s->prefix_rest = (uint32_t)s->prefix & ro_mask(s->resolved - 32U);
+    }
+}
 
 static void ro_select_add(ro_select_t *s, double value)
 {
     uint64_t key = ro_key(value);
+    uint32_t hi = (uint32_t)(key >> 32);
+    uint32_t lo = (uint32_t)key;
 
-    if (s->high_shift < 64U && (key >> s->high_shift) != s->prefix) {
-        return;
+    if (s->resolved > 0U) {
+        if (s->resolved <= 32U) {
+            if ((hi >> (32U - s->resolved)) != s->prefix_top) {
+                return;
+            }
+        } else if (hi != s->prefix_top ||
+                   (lo >> (64U - s->resolved)) != s->prefix_rest) {
+            return;
+        }
     }
     if (s->collect) {
         /* Only a bucket of at most RO_MAX_CANDIDATES values is collected. */
         s->work->candidates[s->n_candidates++] = value;
     } else {
-        s->work->histogram[(uint32_t)(key >> s->shift) & s->digit_mask]++;
+        s->work->histogram[ro_field(hi, lo, s->shift, RO_HISTOGRAM_BITS) & s->digit_mask]++;
     }
 }
 
@@ -286,7 +336,7 @@ static void ro_scan_scope(const ro_capture_t *cap, ro_work_t *work, uint32_t sco
         uint32_t count = cap->bin_count[frame];
         uint32_t start = cap->bin_start[frame];
         double k = ro_burst_factor(cap, frame);
-        int64_t scale = (int64_t)ro_scale(cap, frame);
+        uint32_t scale = ro_scale(cap, frame);
 
         ro_load_frame(cap, work, frame);
         for (pair = 0U; pair < 2U; pair++) {
@@ -296,9 +346,9 @@ static void ro_scan_scope(const ro_capture_t *cap, ro_work_t *work, uint32_t sco
                     for (bin = 0U; bin < count; bin++) {
                         double value;
                         if (scope == RO_SCOPE_BURST) {
-                            value = (double)ro_burst_residual(cap, work, index, pair, rx, bin) * k;
+                            value = ro_burst_residual(cap, work, index, pair, rx, bin) * k;
                         } else {
-                            int64_t n_scale = (int64_t)work->total_count[start + bin] * scale;
+                            double n_scale = (double)(work->total_count[start + bin] * scale);
                             value = ro_window_residual(work, index, pair, rx, bin, start + bin,
                                                        n_scale) *
                                     work->inv_nn[start + bin];
@@ -357,7 +407,8 @@ static void ro_select_ranks(const ro_capture_t *cap, ro_work_t *work, uint32_t s
 
     s.work = work;
     s.prefix = 0U;
-    s.high_shift = 64U;
+    s.resolved = 0U;
+    ro_select_split_prefix(&s);
     while (resolved < 64U) {
         uint32_t bits = (64U - resolved < RO_HISTOGRAM_BITS) ? (64U - resolved)
                                                              : RO_HISTOGRAM_BITS;
@@ -380,7 +431,8 @@ static void ro_select_ranks(const ro_capture_t *cap, ro_work_t *work, uint32_t s
         rank_b -= below_b;
         s.prefix = (s.prefix << bits) | digit_a;
         resolved += bits;
-        s.high_shift = 64U - resolved;
+        s.resolved = resolved;
+        ro_select_split_prefix(&s);
         if (resolved < 64U && work->histogram[digit_a] <= RO_MAX_CANDIDATES) {
             s.collect = 1U;
             s.n_candidates = 0U;
@@ -484,7 +536,7 @@ static void ro_write_power_map(const ro_capture_t *cap, ro_work_t *work, uint32_
         uint32_t count = cap->bin_count[frame];
         uint32_t start = cap->bin_start[frame];
         double k = ro_burst_factor(cap, frame);
-        int64_t scale = (int64_t)ro_scale(cap, frame);
+        uint32_t scale = ro_scale(cap, frame);
         uint32_t a, b;
 
         ro_gate_columns(cap, frame, gate_lo, gate_hi, &a, &b);
@@ -496,16 +548,16 @@ static void ro_write_power_map(const ro_capture_t *cap, ro_work_t *work, uint32_
             for (bin = a; bin < b; bin++) {
                 double power;
                 if (scope == RO_SCOPE_BURST) {
-                    int64_t residual = 0;
+                    double residual = 0.0;  /* a sum of exact integers: exact */
                     for (pair = 0U; pair < 2U; pair++) {
                         for (rx = 0U; rx < cap->n_rx; rx++) {
                             residual += ro_burst_residual(
                                 cap, work, ro_code_index(cap, count, pair, loop, rx), pair, rx, bin);
                         }
                     }
-                    power = (double)residual * k;
+                    power = residual * k;
                 } else {
-                    int64_t n_scale = (int64_t)work->total_count[start + bin] * scale;
+                    double n_scale = (double)(work->total_count[start + bin] * scale);
                     double residual = 0.0;
                     for (pair = 0U; pair < 2U; pair++) {
                         for (rx = 0U; rx < cap->n_rx; rx++) {
@@ -594,8 +646,8 @@ int32_t ro_stream_overview(const ro_capture_t *cap, uint16_t gate_lo,
             for (bin = means_lo; bin < means_hi; bin++) {
                 uint32_t n = work->total_count[bin];
                 double denominator = (n == 0U) ? 1.0 : (double)n;
-                ro_write_f32(sink, ctx, (double)work->total_re[pair][rx][bin] / denominator);
-                ro_write_f32(sink, ctx, (double)work->total_im[pair][rx][bin] / denominator);
+                ro_write_f32(sink, ctx, work->total_re[pair][rx][bin] / denominator);
+                ro_write_f32(sink, ctx, work->total_im[pair][rx][bin] / denominator);
             }
         }
     }

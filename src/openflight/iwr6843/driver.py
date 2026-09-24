@@ -194,13 +194,17 @@ class IWR6843Radar:
         self._require_done("overviewCfg", self.cmd(f"overviewCfg {gate[0]} {gate[1]}", 2.0))
 
     def read_overview(self, timeout_s: float = 10.0, stall_tolerance_s: float = 4.0) -> bytes:
-        """Fire `l3overview`: freeze, return the overview, and leave the ring held."""
+        """Fire `l3overview`: freeze, return the overview, and leave the ring held.
+
+        The firmware computes the whole overview before its first byte, so
+        only ``timeout_s`` bounds that wait, not ``stall_tolerance_s``.
+        """
         return self._read_framed(
             b"l3overview\n",
             overview_nbytes,
             timeout_s=timeout_s,
             stall_tolerance_s=stall_tolerance_s,
-            fail_on_cli_error=True,
+            reduced_response=True,
         )
 
     def read_strips(
@@ -215,7 +219,7 @@ class IWR6843Radar:
             _dump_nbytes,
             timeout_s=timeout_s,
             stall_tolerance_s=stall_tolerance_s,
-            fail_on_cli_error=True,
+            reduced_response=True,
         )
 
     def release(self) -> None:
@@ -229,17 +233,22 @@ class IWR6843Radar:
         *,
         timeout_s: float,
         stall_tolerance_s: float,
-        fail_on_cli_error: bool = False,
+        reduced_response: bool = False,
     ) -> bytes:
         """Send ``command`` and read one ILD1-framed response sized by ``size_of``.
 
-        ``fail_on_cli_error`` raises as soon as the firmware answers with an
-        Error line instead of a response, rather than waiting out the timeout.
+        ``reduced_response`` (overview and strips): raise as soon as the
+        firmware answers with an Error line, count ``stall_tolerance_s`` only
+        once the response has started (the command echo is not a response),
+        and raise if no response arrives. ``l3dump`` keeps its original
+        best-effort contract.
         """
+        name = command.decode().split()[0]
         self.ser.reset_input_buffer()
         self.ser.write(command)
         buf = bytearray()
         expected: int | None = None
+        synced = False
         start = time.time()
         last = start
         while time.time() - start < timeout_s:
@@ -248,15 +257,17 @@ class IWR6843Radar:
             if chunk:
                 buf.extend(chunk)
                 last = time.time()
-            elif buf and time.time() - last > stall_tolerance_s:
+            elif (
+                buf and (synced or not reduced_response) and time.time() - last > stall_tolerance_s
+            ):
                 break
             if expected is None:
                 idx = buf.find(MAGIC)
-                if idx < 0 and fail_on_cli_error and b"Error" in buf:
+                synced = synced or idx >= 0
+                if idx < 0 and reduced_response and b"Error" in buf:
                     trailer = self._wait_for_dump_cli_ready(bytes(buf), timeout_s=0.2)
                     raise RuntimeError(
-                        f"IWR6843 {command.decode().split()[0]} failed: "
-                        f"{trailer.decode(errors='replace').strip()}"
+                        f"IWR6843 {name} failed: {trailer.decode(errors='replace').strip()}"
                     )
                 if idx >= 0 and len(buf) - idx >= HEADER.size:
                     del buf[:idx]
@@ -267,6 +278,10 @@ class IWR6843Radar:
             elif len(buf) >= expected:
                 break
         if expected is None:
+            if reduced_response:
+                raise RuntimeError(
+                    f"IWR6843 {name} sent no response within {timeout_s:.1f} s: {bytes(buf)[:80]!r}"
+                )
             return bytes(buf)
 
         payload = bytes(buf[:expected])

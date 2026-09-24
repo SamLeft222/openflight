@@ -280,3 +280,64 @@ def test_overview_gate_rejected_by_firmware_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="overviewCfg"):
         radar.configure_overview_gate((98, 48))
+
+
+class _TimedSerial:
+    """Serial double that releases each chunk only after its delay."""
+
+    def __init__(self, chunks):
+        self.start = time.monotonic()
+        self.chunks = [(delay, bytearray(data)) for delay, data in chunks]
+        self.writes = []
+
+    def _ready(self):
+        elapsed = time.monotonic() - self.start
+        return self.chunks[0][1] if self.chunks and elapsed >= self.chunks[0][0] else None
+
+    @property
+    def in_waiting(self):
+        ready = self._ready()
+        return len(ready) if ready is not None else 0
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, data):
+        self.writes.append(data)
+
+    def read(self, count):
+        ready = self._ready()
+        if ready is None:
+            time.sleep(0.005)
+            return b""
+        data = bytes(ready[:count])
+        del ready[:count]
+        if not ready:
+            self.chunks.pop(0)
+        return data
+
+
+def test_read_overview_waits_out_the_compute_before_the_first_byte():
+    """rc2 on the radar: the echo came back, then seconds of compute."""
+    overview = reduced.pack_overview(reduced.build_overview(_synthetic_capture(), gate=(48, 98)))
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = _TimedSerial([(0.0, b"l3overview\r\n"), (0.3, overview + b"Done\r\n")])
+
+    assert radar.read_overview(timeout_s=2.0, stall_tolerance_s=0.1) == overview
+
+
+def test_read_overview_reports_a_missing_response():
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = _TimedSerial([(0.0, b"l3overview\r\n")])
+
+    with pytest.raises(RuntimeError, match="l3overview sent no response"):
+        radar.read_overview(timeout_s=0.3, stall_tolerance_s=0.05)
+
+
+def test_read_dump_still_gives_up_after_a_stall_following_the_echo():
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = _TimedSerial([(0.0, b"l3dump\r\n")])
+    start = time.monotonic()
+
+    assert radar.read_dump(timeout_s=5.0, stall_tolerance_s=0.05) == b"l3dump\r\n"
+    assert time.monotonic() - start < 1.0

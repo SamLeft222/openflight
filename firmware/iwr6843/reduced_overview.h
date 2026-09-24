@@ -71,11 +71,15 @@ typedef struct {
     uint8_t count;
 } ro_window_t;
 
-/* Working memory for the overview (~104 KB; keep it off the stack). */
+/* Working memory for the overview (~104 KB; keep it off the stack).
+ *
+ * The R4F has no 64-bit integer multiply-to-double path, so exact integer
+ * quantities (all below 2^53 for every supported capture) are held in
+ * doubles, where they stay exact. */
 typedef struct {
     /* Window scope: scaled code sums T and loop counts n per absolute bin. */
-    int64_t  total_re[2][RO_MAX_RX][RO_BIN_SPACE];
-    int64_t  total_im[2][RO_MAX_RX][RO_BIN_SPACE];
+    double   total_re[2][RO_MAX_RX][RO_BIN_SPACE];
+    double   total_im[2][RO_MAX_RX][RO_BIN_SPACE];
     uint32_t total_count[RO_BIN_SPACE];
     double   inv_nn[RO_BIN_SPACE];               /* 1 / n^2 */
     /* One frame's vertical-pair codes [pair][loop][rx][bin] and loop sums. */

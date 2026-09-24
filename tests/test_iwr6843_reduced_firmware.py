@@ -210,3 +210,30 @@ def test_log_table_header_matches_its_generator():
     )
 
     assert result.returncode == 0, "run firmware/iwr6843/gen_reduced_log_table.py"
+
+
+def test_uniform_capture_takes_the_median_to_the_last_bit(harness, tmp_path):
+    """Every |MTI|^2 identical and non-zero: the median's radix selection never
+    narrows to a small bucket, so it resolves all 64 key bits, crossing from
+    the high 32-bit word into the low one."""
+    cube = np.zeros((N_FRAMES, 36, 4, N_BINS), dtype=complex)
+    cube[:, 0::2] = 37 * 128 + 11j * 128  # loops alternate +c / -c on every TX
+    cube[:, 1::2] = -(37 * 128 + 11j * 128)
+    raw = pack_dump(
+        cube,
+        n_tx=3,
+        version=7,
+        frame_period_us=PERIOD_US,
+        sample_fmt=SAMPLE_RANGE_FFT_IQ16_VARIABLE_TIMED,
+        range_bin_starts=STARTS,
+        range_bin_counts=(N_BINS,) * N_FRAMES,
+        frame_time_offsets_us=tuple(PERIOD_US * f for f in range(N_FRAMES)),
+        temperature_report={key: 40 for key in TEMP_REPORT_KEYS},
+    )
+    expected = reduced.pack_overview(reduced.build_overview(raw, gate=GATE))
+
+    result = _run(harness, tmp_path, raw, "overview", *map(str, GATE))
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+    assert reduced.parse_overview(expected).noise["burst"] > 0
