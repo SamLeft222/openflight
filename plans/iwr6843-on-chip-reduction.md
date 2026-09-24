@@ -215,21 +215,40 @@ the TI toolchain confirmed the suspicion: it called `__aeabi_lmul` and
 into 32-bit halves so its per-value work needs no 64-bit shift helper
 either (those remain once per pass). The reader now starts its stall timer
 only once the response has begun, and reports a missing response instead
-of returning the echo. Hardware timing pending.
+of returning the echo.
+
+On the radar (2026-09-24) rc3 passed all 23 checks: overview and strips
+byte-identical to the reference from the same freeze in 3 cycles, release,
+error paths, 10 s timeout, l3dump after the timeout. Timings (median):
+
+| | rc1 | rc3 |
+|---|---|---|
+| compute before the first byte (`prepare_ms`) | ~2.3 s | 1.26 s |
+| overview in firmware (`overview_ms`) | 2.96 s | 2.16 s |
+| overview as the Pi receives it | 3.01 s | 2.22 s |
+| strips (diagonal / whole windows / none) | 0.29 / 0.54 / 0.10 s | same |
+| full `l3dump` | 5.28 s | 5.28 s |
+
+The overview now lands ~0.3 s after the OPS speed (~1.9 s). Estimated IWR
+result ~3.5-3.8 s vs ~6.4 s today (to be measured in Phase 3). The compute
+is ~9 passes over the frozen ring at ~0.15 s each (sums, 3 per noise
+median, 2 for the power maps); sharing the two medians' passes would remove
+3 of them.
 
 ### Acceptance criteria
 
-- [ ] From one freeze, `l3overview` + `l3strip` output equals the Phase 0 chip
-      model applied to an `l3dump` of the same freeze. *Off-target:* the C
-      core compiled for the host is byte-identical to `reduced.py` on all 80
-      saved field captures (overview) and on random strip requests; pending
-      the hardware script.
+- [x] From one freeze, `l3overview` + `l3strip` output equals the Phase 0 chip
+      model applied to an `l3dump` of the same freeze (rc1 and rc3 on the
+      radar, 3 cycles each; host: all 80 saved captures).
 - [ ] `stats` reports overview compute time, strip requests, release, and
-      timeout re-arms; no HWA misses or EDMA errors across repeated cycles.
-      rc1 measured 2.96 s per overview (too slow); rc2 pending.
-- [ ] A host that never sends `l3release` does not leave the radar frozen.
-- [ ] `l3dump` behaviour is unchanged (refactored into shared header, frame
-      plan, and resume helpers; the image changes).
+      timeout re-arms (done); no HWA misses or EDMA errors across repeated
+      cycles (not yet checked -- the hardware script does not read those
+      counters).
+- [x] A host that never sends `l3release` does not leave the radar frozen
+      (timeout resumes capture after 10 s; checked on rc1 and rc3).
+- [x] `l3dump` behaviour is unchanged (refactored into shared header, frame
+      plan, and resume helpers; verified on the radar before, between, and
+      after reduced transfers).
 
 ## Phase 3: Host integration behind a flag
 
