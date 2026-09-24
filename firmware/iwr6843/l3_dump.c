@@ -361,6 +361,7 @@ static uint32_t                gReducedReleases;
 static uint32_t                gReducedTimeouts;
 static uint32_t                gReducedErrors;
 static uint32_t                gReducedOverviewMs;
+static uint32_t                gReducedPrepareMs;
 #endif
 
 /* --- SDK handles ----------------------------------------------------------- */
@@ -2838,11 +2839,12 @@ static int32_t l3_cli_stats(int32_t argc, char *argv[])
 #endif
 #endif
 #ifdef L3_REDUCED_TRANSFER
-    CLI_write("reduced: held=%u gate=%u-%u overviews=%u overview_ms=%u strips=%u "
-              "releases=%u timeouts=%u errors=%u\n",
+    CLI_write("reduced: held=%u gate=%u-%u overviews=%u overview_ms=%u prepare_ms=%u "
+              "strips=%u releases=%u timeouts=%u errors=%u\n",
               (unsigned)gReducedHeld, (unsigned)gOverviewGateLo,
               (unsigned)gOverviewGateHi, (unsigned)gReducedOverviews,
-              (unsigned)gReducedOverviewMs, (unsigned)gReducedStrips,
+              (unsigned)gReducedOverviewMs, (unsigned)gReducedPrepareMs,
+              (unsigned)gReducedStrips,
               (unsigned)gReducedReleases, (unsigned)gReducedTimeouts,
               (unsigned)gReducedErrors);
 #endif
@@ -3543,19 +3545,22 @@ static int32_t l3_cli_overview(int32_t argc, char *argv[])
         CLI_write("Error: frozen capture cannot be described\n");
         return -1;
     }
-    l3_writeHeldHeader();
+    /* Compute first: a noise failure must not leave a half-sent response. */
     startTick = Clock_getTicks();
-    status = ro_write_overview(&gHeldCapture, gOverviewGateLo, gOverviewGateHi,
-                               &gReducedWork, l3_reducedSink, NULL);
-    gReducedOverviewMs = l3_elapsedMs(startTick);
+    status = ro_prepare_overview(&gHeldCapture, gOverviewGateLo, gOverviewGateHi,
+                                 &gReducedWork);
+    gReducedPrepareMs = l3_elapsedMs(startTick);
     if (status != RO_OK) {
-        /* Only RO_ERR_NOISE remains, found before any overview byte. */
         gReducedErrors++;
         (void)l3_resumeCapture();
         l3_reducedUnlock();
         CLI_write("Error: overview failed (%d)\n", (int)status);
         return -1;
     }
+    l3_writeHeldHeader();
+    (void)ro_stream_overview(&gHeldCapture, gOverviewGateLo, gOverviewGateHi,
+                             &gReducedWork, l3_reducedSink, NULL);
+    gReducedOverviewMs = l3_elapsedMs(startTick);
     gReducedOverviews++;
     gReducedHeld = 1U;
     gReducedHoldTick = Clock_getTicks();

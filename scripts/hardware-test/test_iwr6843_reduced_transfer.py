@@ -97,7 +97,8 @@ def run_cycle(checks: Checks, radar: IWR6843Radar, gate, out: Path | None, index
     full = radar.read_dump()
     timings["full_dump_s"] = time.monotonic() - start
     stats = radar.stats()
-    timings["overview_compute_ms"] = _stat(stats, "overview_ms")
+    timings["overview_firmware_ms"] = _stat(stats, "overview_ms")
+    timings["overview_compute_ms"] = _stat(stats, "prepare_ms")
 
     _compare_overview(checks, packed, full, gate)
     for name, (request, data) in strips.items():

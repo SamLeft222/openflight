@@ -46,6 +46,8 @@ def _harness(tmp_path_factory):
             "-Wextra",
             "-Werror",
             "-Wno-long-long",
+            # A fused multiply-add rounds differently from the radar's VFPv3.
+            "-ffp-contract=off",
             "-O2",
             "-o",
             str(exe),

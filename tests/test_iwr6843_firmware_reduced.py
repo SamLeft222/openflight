@@ -70,8 +70,10 @@ def test_overview_freezes_validates_then_streams_then_holds():
 
     assert _before(body, "l3_stopCaptureAtBoundary", "l3_describeHeldCapture")
     assert _before(body, "ro_check_overview", "l3_writeHeldHeader")
-    assert _before(body, "l3_writeHeldHeader", "ro_write_overview")
-    assert _before(body, "ro_write_overview", "gReducedHeld = 1U")
+    # every computation that can fail happens before the first response byte
+    assert _before(body, "ro_prepare_overview", "l3_writeHeldHeader")
+    assert _before(body, "l3_writeHeldHeader", "ro_stream_overview")
+    assert _before(body, "ro_stream_overview", "gReducedHeld = 1U")
     assert "a capture is already held" in body
 
 
@@ -158,5 +160,10 @@ def test_stats_reports_the_reduced_transfer():
     body = _function("static int32_t l3_cli_stats")
 
     assert "reduced: held=%u" in body
-    for counter in ("gReducedOverviewMs", "gReducedTimeouts", "gReducedErrors"):
+    for counter in (
+        "gReducedOverviewMs",
+        "gReducedPrepareMs",
+        "gReducedTimeouts",
+        "gReducedErrors",
+    ):
         assert counter in body

@@ -111,6 +111,7 @@ def test_unrepresentable_power_is_rejected(bad):
 
 
 def test_overview_holds_gate_power_noise_and_means(capture, overview):
+    """The overview's integer maths agrees with the float MTI to the last ulp or so."""
     vertical = _vertical(capture)
     loops = 12
 
@@ -119,13 +120,16 @@ def test_overview_holds_gate_power_noise_and_means(capture, overview):
         for frame, start in enumerate(STARTS):
             a, b = max(GATE[0], start) - start, min(GATE[1], start + N_BINS) - start
             rows = slice(frame * loops, (frame + 1) * loops)
-            np.testing.assert_array_equal(overview.power[scope][rows, a:b], full[rows, a:b])
+            np.testing.assert_allclose(
+                overview.power[scope][rows, a:b], full[rows, a:b], rtol=1e-12
+            )
             assert not overview.power[scope][rows, :a].any()
             assert not overview.power[scope][rows, b:].any()
-        assert overview.noise[scope] == vertical.noise_power(scope)
-    np.testing.assert_array_equal(
+        assert overview.noise[scope] == pytest.approx(vertical.noise_power(scope), rel=1e-12)
+    np.testing.assert_allclose(
         overview.window_means,
         tracking.compute_window_means(vertical.cube, vertical.geometry, range_domain=True),
+        rtol=1e-12,
     )
 
 

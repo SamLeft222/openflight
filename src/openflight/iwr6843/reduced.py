@@ -35,10 +35,9 @@ from openflight.iwr6843.dump import (
     pack_dump,
     parse_capture_metadata,
     parse_dump,
-    project_tx_pair,
 )
 from openflight.iwr6843.lcmf import TRACK_TIME_MARGIN_S, PreparedLCMFCapture, prepare_lcmf_capture
-from openflight.iwr6843.shot import TX2_LOOP_PERIOD_S, geometry_from_header, prepare_shot_dump
+from openflight.iwr6843.shot import TX2_LOOP_PERIOD_S, geometry_from_header
 from openflight.iwr6843.tracking import MTI_SCOPES, BallTrack, Geometry
 
 OVERVIEW_MAGIC = b"ILOV"
@@ -139,32 +138,97 @@ def decode_log_power(codes: np.ndarray) -> np.ndarray:
 # -- the radar side (firmware reference) -------------------------------------
 
 
+def _vertical_codes(meta: dict, cube: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, int]]:
+    """Per frame: integer (re, im) codes [pair, loop, rx, bin] of the vertical TX pair, scale."""
+    loops = _loops(meta)
+    pair = VERTICAL_TX_PAIR if meta["n_tx"] == 3 else (0, 1)
+    scales = meta.get("iq8_scales") or (1,) * meta["n_frames"]
+    frames = []
+    for frame, count in enumerate(meta["range_bin_counts"]):
+        tdm = cube[frame, :, :, :count].reshape(loops, meta["n_tx"], meta["n_rx"], count)
+        stored = tdm[:, list(pair)].transpose(1, 0, 2, 3) / scales[frame]
+        frames.append(
+            (
+                np.rint(stored.real).astype(np.int64),
+                np.rint(stored.imag).astype(np.int64),
+                int(scales[frame]),
+            )
+        )
+    return frames
+
+
 def build_overview(raw: bytes, *, gate: tuple[int, int]) -> Overview:
-    """What the radar computes from its full ring, before quantisation."""
-    meta = parse_capture_metadata(raw)
+    """What the radar computes from its full ring, before quantisation.
+
+    Integer formulation shared bit-for-bit with firmware/iwr6843/
+    reduced_overview.c. For stored codes c (sample = c * scale s) over L
+    loops, burst-scope MTI power is exactly s^2 |L c - sum c|^2 / L^2 and
+    window-scope power is |n s c - T|^2 / n^2 with T the bin's scaled code
+    sum over its n loops. Each is rounded once, so it can differ from the
+    float MTI of the full-capture path in the last ulp.
+    """
+    meta, cube = parse_dump(raw)
     _require_timed(meta)
     lo, hi = gate
     if not 0 <= lo < hi <= 0xFFFF:
         raise ValueError(f"invalid gate {gate}")
-    vertical_raw = project_tx_pair(raw, VERTICAL_TX_PAIR) if meta["n_tx"] == 3 else raw
-    prepared = prepare_shot_dump(vertical_raw)
     loops = _loops(meta)
-    power = {}
-    for scope in MTI_SCOPES:
-        full = prepared.loop_power(scope)
-        kept = np.zeros_like(full)
-        for frame, (a, b) in enumerate(_gate_columns(meta, gate)):
-            rows = slice(frame * loops, (frame + 1) * loops)
-            kept[rows, a:b] = full[rows, a:b]
-        power[scope] = kept
+    n_rx = meta["n_rx"]
+    frames = _vertical_codes(meta, cube)
+    fft_size = tracking.window_fft_size(geometry_from_header(meta))
+
+    # Window-scope sums: T per (pair, rx, bin) and loop count n per bin.
+    total_re = np.zeros((2, n_rx, fft_size), dtype=np.int64)
+    total_im = np.zeros((2, n_rx, fft_size), dtype=np.int64)
+    counts = np.zeros(fft_size, dtype=np.int64)
+    for (re, im, scale), start, count in zip(
+        frames, meta["range_bin_starts"], meta["range_bin_counts"]
+    ):
+        total_re[:, :, start : start + count] += scale * re.sum(axis=1)
+        total_im[:, :, start : start + count] += scale * im.sum(axis=1)
+        counts[start : start + count] += loops
+
+    n_rows = meta["n_frames"] * loops
+    power = {scope: np.zeros((n_rows, meta["n_samples"])) for scope in MTI_SCOPES}
+    values: dict[str, list[np.ndarray]] = {scope: [] for scope in MTI_SCOPES}
+    columns = _gate_columns(meta, (lo, hi))
+    for frame, ((re, im, scale), start, count) in enumerate(
+        zip(frames, meta["range_bin_starts"], meta["range_bin_counts"])
+    ):
+        rows = slice(frame * loops, (frame + 1) * loops)
+        a, b = columns[frame]
+
+        # burst: N = |L c - sum c|^2 exactly; power = N * s^2 / L^2
+        k = (scale * scale) / (loops * loops)
+        e_re = loops * re - re.sum(axis=1, keepdims=True)
+        e_im = loops * im - im.sum(axis=1, keepdims=True)
+        n_exact = e_re * e_re + e_im * e_im  # [pair, loop, rx, bin]
+        values["burst"].append(n_exact.astype(np.float64).reshape(-1) * k)
+        power["burst"][rows, a:b] = n_exact.sum(axis=(0, 2))[:, a:b].astype(np.float64) * k
+
+        # window: M = |n s c - T|^2 (float), power = M / n^2
+        n_bin = counts[start : start + count]
+        inv_nn = 1.0 / (n_bin * n_bin).astype(np.float64)
+        w_re = (n_bin * scale * re - total_re[:, None, :, start : start + count]).astype(np.float64)
+        w_im = (n_bin * scale * im - total_im[:, None, :, start : start + count]).astype(np.float64)
+        m = w_re * w_re + w_im * w_im  # [pair, loop, rx, bin]
+        values["window"].append((m * inv_nn).reshape(-1))
+        summed = np.zeros((loops, count))
+        for pair_index in range(2):  # the firmware's summation order
+            for rx in range(n_rx):
+                summed = summed + m[pair_index, :, rx, :]
+        power["window"][rows, a:b] = (summed * inv_nn)[:, a:b]
+
+    means = np.zeros((2, n_rx, fft_size), dtype=complex)
+    held = counts > 0
+    means.real[:, :, held] = total_re[:, :, held] / counts[held]
+    means.imag[:, :, held] = total_im[:, :, held] / counts[held]
     return Overview(
         capture_prefix=capture_metadata_prefix(raw),
         gate=(lo, hi),
         power=power,
-        noise={scope: prepared.noise_power(scope) for scope in MTI_SCOPES},
-        window_means=tracking.compute_window_means(
-            prepared.cube, prepared.geometry, range_domain=prepared.range_domain
-        ),
+        noise={scope: float(np.median(np.concatenate(values[scope]))) for scope in MTI_SCOPES},
+        window_means=means,
     )
 
 

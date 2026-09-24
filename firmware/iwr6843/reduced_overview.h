@@ -11,6 +11,13 @@
  * imaginary-then-real order, as int8 (IQ8, times the frame scale) or
  * little-endian int16 (IQ16).
  *
+ * The maths is integer where it can be: for stored codes c over L loops,
+ * burst-scope MTI power is s^2 |L c - sum c|^2 / L^2 and window-scope power
+ * is |n s c - T|^2 / n^2, each rounded once. reduced.py uses the same
+ * formulation, so the bytes match exactly. Hosts must build with
+ * -ffp-contract=off: a fused multiply-add would round differently (the
+ * radar's VFPv3 has none).
+ *
  * Output goes through a byte sink so nothing large is buffered. The caller
  * writes the dump header and temperature report first; these functions write
  * everything after it.
@@ -25,7 +32,9 @@
 #define RO_OVERVIEW_HEADER_BYTES 24U
 #define RO_MAX_FRAMES            64U
 #define RO_MAX_RX                4U
-#define RO_MAX_LOOPS             64U
+#define RO_MAX_LOOPS             16U   /* L3_MAX_LOOPS in l3_dump.c */
+#define RO_MAX_FRAME_BINS        64U   /* L3_RING_MAX_BINS in l3_dump.c */
+#define RO_FRAME_VALUES          (2U * RO_MAX_LOOPS * RO_MAX_RX * RO_MAX_FRAME_BINS)
 #define RO_BIN_SPACE             256U  /* absolute range bins are uint8 */
 #define RO_HISTOGRAM_BITS        12U
 #define RO_MAX_CANDIDATES        2048U
@@ -62,17 +71,27 @@ typedef struct {
     uint8_t count;
 } ro_window_t;
 
-/* Working memory for ro_write_overview (~98 KB; keep it off the stack). */
+/* Working memory for the overview (~104 KB; keep it off the stack). */
 typedef struct {
-    double   sum_re[2][RO_MAX_RX][RO_BIN_SPACE];
-    double   sum_im[2][RO_MAX_RX][RO_BIN_SPACE];
-    uint32_t sum_count[RO_BIN_SPACE];
-    /* The static means one frame's MTI subtracts, cached per frame. */
-    double   mean_re[2][RO_MAX_RX][RO_BIN_SPACE];
-    double   mean_im[2][RO_MAX_RX][RO_BIN_SPACE];
+    /* Window scope: scaled code sums T and loop counts n per absolute bin. */
+    int64_t  total_re[2][RO_MAX_RX][RO_BIN_SPACE];
+    int64_t  total_im[2][RO_MAX_RX][RO_BIN_SPACE];
+    uint32_t total_count[RO_BIN_SPACE];
+    double   inv_nn[RO_BIN_SPACE];               /* 1 / n^2 */
+    /* One frame's vertical-pair codes [pair][loop][rx][bin] and loop sums. */
+    int16_t  code_re[RO_FRAME_VALUES];
+    int16_t  code_im[RO_FRAME_VALUES];
+    int32_t  sum_re[2][RO_MAX_RX][RO_MAX_FRAME_BINS];
+    int32_t  sum_im[2][RO_MAX_RX][RO_MAX_FRAME_BINS];
     uint32_t histogram[1U << RO_HISTOGRAM_BITS];
     double   candidates[RO_MAX_CANDIDATES];
     uint8_t  row[2U * RO_BIN_SPACE];
+    /* Set by ro_prepare_overview for ro_stream_overview. */
+    double   noise_burst;
+    double   noise_window;
+    uint16_t prepared_gate_lo;
+    uint16_t prepared_gate_hi;
+    uint8_t  prepared;
 } ro_work_t;
 
 /* Per-frame descriptors (start, count, delta) and, for IQ8, the scale table.
@@ -80,14 +99,24 @@ typedef struct {
 void ro_write_frame_tables(const ro_capture_t *cap, const ro_window_t *windows,
                            ro_sink_t sink, void *ctx);
 
-/* RO_OK when ro_write_overview would accept the capture and gate. The only
- * later failure is RO_ERR_NOISE, found before anything is written. */
+/* RO_OK when the overview accepts the capture and gate. The only later
+ * failure is RO_ERR_NOISE, from ro_prepare_overview, before any output. */
 int32_t ro_check_overview(const ro_capture_t *cap, uint16_t gate_lo, uint16_t gate_hi);
 
 /* RO_OK when ro_write_strips would accept the request. */
 int32_t ro_check_strips(const ro_capture_t *cap, const ro_window_t *request);
 
-/* Frame tables, overview header, both power maps, and window means. */
+/* Window sums and both noise medians; writes nothing. */
+int32_t ro_prepare_overview(const ro_capture_t *cap, uint16_t gate_lo,
+                            uint16_t gate_hi, ro_work_t *work);
+
+/* Frame tables, overview header, both power maps, and window means, for a
+ * capture and gate ro_prepare_overview accepted. */
+int32_t ro_stream_overview(const ro_capture_t *cap, uint16_t gate_lo,
+                           uint16_t gate_hi, ro_work_t *work,
+                           ro_sink_t sink, void *ctx);
+
+/* ro_prepare_overview then ro_stream_overview. */
 int32_t ro_write_overview(const ro_capture_t *cap, uint16_t gate_lo,
                           uint16_t gate_hi, ro_work_t *work,
                           ro_sink_t sink, void *ctx);

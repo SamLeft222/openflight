@@ -6,7 +6,9 @@ measure it three ways and report how they compare and how many bytes the
 radar would have sent:
 
 * ``full``      -- the whole capture, as the server measures it today;
-* ``exact``     -- overview (unquantised) + strips; must equal ``full``;
+* ``exact``     -- overview (unquantised) + strips: the same shot as ``full``
+                   (its integer MTI maths can differ from the float path in the
+                   last ulp, so track fields may differ at that level);
 * ``reduced``   -- overview as packed on the wire (log16 power, float32
                    noise and means) + strips: what the radar would send.
 
@@ -139,7 +141,8 @@ def evaluate_capture(item: ReplayInput, settings: Settings) -> dict:
         "ball_speed_mph": item.ball_speed_mph,
         "full_status": full.status,
         "full_launch_deg": full.angle_deg,
-        "exact_match": exact.to_dict() == full.to_dict(),
+        "exact_status": exact.status,
+        "exact_launch_deg": exact.angle_deg,
         "reduced_status": reduced.status,
         "reduced_launch_deg": reduced.angle_deg,
         "capture_bytes": len(raw),
@@ -155,18 +158,22 @@ def summarise(rows: list[dict], rate: float) -> dict:
     def seconds(values):
         return round(statistics.median(values) / rate, 2) if values else None
 
-    both = [
-        row
-        for row in rows
-        if row["full_launch_deg"] is not None and row["reduced_launch_deg"] is not None
-    ]
-    shifts = sorted(abs(row["reduced_launch_deg"] - row["full_launch_deg"]) for row in both)
+    def shifts_of(key):
+        return sorted(
+            abs(row[key] - row["full_launch_deg"])
+            for row in rows
+            if row["full_launch_deg"] is not None and row[key] is not None
+        )
+
+    exact_shifts = shifts_of("exact_launch_deg")
+    shifts = shifts_of("reduced_launch_deg")
     by_requests: dict[int, list[int]] = {}
     for row in rows:
         by_requests.setdefault(len(row["strip_bytes"]), []).append(row["reduced_bytes"])
     return {
         "captures": len(rows),
-        "exact_matches": sum(row["exact_match"] for row in rows),
+        "exact_status_changes": sum(row["full_status"] != row["exact_status"] for row in rows),
+        "exact_launch_shift_max_deg": exact_shifts[-1] if exact_shifts else None,
         "status_changes": sum(row["full_status"] != row["reduced_status"] for row in rows),
         "launch_shift_deg": {
             "median": statistics.median(shifts) if shifts else None,

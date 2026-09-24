@@ -120,8 +120,9 @@ existing tracker, OPS-guided search, and LCMF. `find_ball` and
       executable definition (`openflight.iwr6843.reduced`), with round-trip
       and malformed-input tests.
 - [x] With an unquantised overview, the reduced path matches the full-data
-      path bit-for-bit: 77/77 saved captures, including the 31 that ran the
-      OPS-guided search (synthetic tests cover both paths as well).
+      path: 77/77 saved captures, including the 31 that ran the OPS-guided
+      search -- bit-for-bit with the original float overview; with the rc2
+      integer maths, identical statuses and launch angles within 3.4e-12 deg.
 - [x] With the int16 log overview, accuracy vs the R10 pairs is unchanged:
       solid shots (n = 50) typical 2.16 deg, mean 3.81 deg, 24 within 2 deg,
       9 beyond 5 deg for both paths. No status changed; angle shift median
@@ -183,8 +184,24 @@ installers are available.
 * `IWR6843Radar.configure_overview_gate / read_overview / read_strips /
   release` on the Pi; `scripts/hardware-test/test_iwr6843_reduced_transfer.py`
   for the on-radar check.
-* Candidate image: `firmware/candidates/l3_dump_reduced_transfer_rc1.bin`
+* Candidate image: `firmware/candidates/l3_dump_reduced_transfer_rc2.bin`
   (not the release until this phase passes on hardware).
+
+### Hardware results
+
+**rc1 (2026-09-24, float maths):** all 23 checks passed on the radar --
+overview and strips byte-identical to the reference from the same freeze
+(3 cycles), release, error paths, and the 10 s timeout. But the overview
+took 2.96 s in firmware (~2.3 s compute + ~0.6 s UART): ~200 cycles per
+sample read, ~10x the estimate. That would leave the IWR result at ~4.5 s.
+
+**rc2 (integer maths):** stored codes decoded once per pass into fast
+memory; burst MTI power is exactly s^2 |L c - sum c|^2 / L^2 and window power
+|n s c - T|^2 / n^2, each rounded once (reduced.py uses the same maths, so C
+and Python still match byte-for-byte on all 80 captures). Against the float
+full-capture path: 0 status changes, launch angles within 3.4e-12 deg
+unquantised; accuracy vs the R10 unchanged. `stats` now also reports
+`prepare_ms` (compute only). Hardware timing pending.
 
 ### Acceptance criteria
 
@@ -195,8 +212,7 @@ installers are available.
       the hardware script.
 - [ ] `stats` reports overview compute time, strip requests, release, and
       timeout re-arms; no HWA misses or EDMA errors across repeated cycles.
-      *Estimate:* ~2.2 M sample reads per dense overview, a few tenths of a
-      second on the 200 MHz R4F (-O3), hidden behind the OPS transfer.
+      rc1 measured 2.96 s per overview (too slow); rc2 pending.
 - [ ] A host that never sends `l3release` does not leave the radar frozen.
 - [ ] `l3dump` behaviour is unchanged (refactored into shared header, frame
       plan, and resume helpers; the image changes).
