@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from openflight.iwr6843.calibration import Calibration
@@ -13,6 +14,7 @@ from openflight.iwr6843.lcmf import (
     PreparedLCMFCapture,
     estimate_lcmf_v1,
     prepare_lcmf_capture,
+    track_capture,
 )
 from openflight.iwr6843.monitor import IWR6843Capture, IWR6843CaptureMonitor
 from openflight.iwr6843.recovery import (
@@ -21,6 +23,15 @@ from openflight.iwr6843.recovery import (
     find_recovery_candidates,
     select_recovery_candidate,
 )
+from openflight.iwr6843.reduced import (
+    ReducedSource,
+    ball_gate_for,
+    corridor_request,
+    prepare_reduced,
+)
+
+# Given the OPS-guided candidates, return the capture to evaluate them on.
+CandidateRefiner = Callable[[list[RecoveryCandidate]], tuple[bytes, PreparedLCMFCapture]]
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +180,7 @@ class IWR6843Runtime:
         candidate = select_recovery_candidate(candidates, prior)
         return candidate.impact_s if candidate is not None else None
 
-    def _ops_guided_measurement(  # pylint: disable=too-many-return-statements
+    def _ops_guided_measurement(  # pylint: disable=too-many-return-statements,too-many-arguments
         self,
         raw: bytes,
         calibration: Calibration,
@@ -178,8 +189,13 @@ class IWR6843Runtime:
         club: str | None,
         baseline: LCMFResult,
         prepared: PreparedLCMFCapture,
+        refine: CandidateRefiner | None = None,
     ) -> LCMFResult:
-        """Replace a suspicious TI range walk with an OPS-compatible one."""
+        """Replace a suspicious TI range walk with an OPS-compatible one.
+
+        ``refine`` supplies the capture the candidates are evaluated on; a
+        reduced transfer uses it to fetch their strips.
+        """
         speed = baseline.track_speed_mph
         if baseline.accepted and speed is None:
             return replace(baseline, status="accepted_track_speed_warning")
@@ -206,6 +222,8 @@ class IWR6843Runtime:
             if baseline.accepted:
                 return replace(baseline, status="accepted_track_speed_warning")
             return baseline
+        if refine is not None and candidates:
+            raw, prepared = refine(candidates)
         recoveries: list[tuple[RecoveryCandidate, LCMFResult]] = []
         for candidate in candidates:
             result = estimate_lcmf_v1(
@@ -244,6 +262,114 @@ class IWR6843Runtime:
             return replace(baseline, status="accepted_track_speed_warning")
         return baseline
 
+    def _measure(  # pylint: disable=too-many-arguments
+        self,
+        raw: bytes,
+        calibration: Calibration,
+        *,
+        prepared: PreparedLCMFCapture,
+        ball_speed_mph: float,
+        club: str | None,
+        refine: CandidateRefiner | None = None,
+    ) -> LCMFResult:
+        """LCMF-v1 on the TI range walk, OPS-guided search, azimuth offset."""
+        measurement = estimate_lcmf_v1(
+            raw,
+            calibration,
+            ball_speed_mph=ball_speed_mph,
+            club=club,
+            net_range_m=self.net_range_m,
+            tx_order=self.tx_order,
+            tdm_sign_policy=self.tdm_sign_policy,
+            horizontal_phase_reference_rad=self.horizontal_phase_reference_rad,
+            prepared=prepared,
+        )
+        if isinstance(measurement, LCMFResult):
+            measurement = self._ops_guided_measurement(
+                raw,
+                calibration,
+                ball_speed_mph=ball_speed_mph,
+                club=club,
+                baseline=measurement,
+                prepared=prepared,
+                refine=refine,
+            )
+        horizontal_deg = getattr(measurement, "horizontal_deg", None)
+        if horizontal_deg is not None:
+            measurement = replace(
+                measurement,
+                horizontal_deg=horizontal_deg + self.azimuth_offset_deg,
+                horizontal_raw_deg=horizontal_deg,
+            )
+        return measurement
+
+    def measure_capture(
+        self,
+        raw: bytes,
+        *,
+        ball_speed_mph: float,
+        club: str | None,
+        calibration: Calibration | None = None,
+    ) -> LCMFResult:
+        """LCMF-v1 measurement of one full capture."""
+        return self._measure(
+            raw,
+            calibration or self.calibration,
+            prepared=prepare_lcmf_capture(raw),
+            ball_speed_mph=ball_speed_mph,
+            club=club,
+        )
+
+    def measure_reduced(
+        self,
+        source: ReducedSource,
+        *,
+        ball_speed_mph: float,
+        club: str | None,
+        calibration: Calibration | None = None,
+    ) -> LCMFResult:
+        """The same measurement from an overview and strips (on-chip reduction plan).
+
+        The tracker runs on the overview's power maps, strips are requested
+        along the chosen track, and the OPS-guided search fetches its
+        candidates' strips through ``refine``. Everything else is the
+        full-capture path unchanged.
+        """
+        calibration = calibration or self.calibration
+        overview = source.overview()
+        meta = overview.metadata
+        expected_gate = ball_gate_for(meta, self.net_range_m)
+        if overview.gate != expected_gate:
+            raise ValueError(
+                f"overview gate {overview.gate} does not match the tracker gate {expected_gate}"
+            )
+        raw, prepared = prepare_reduced(overview)
+        baseline = track_capture(
+            raw,
+            calibration,
+            prepared=prepared,
+            club=club,
+            net_range_m=self.net_range_m,
+            tx_order=self.tx_order,
+            tdm_sign_policy=self.tdm_sign_policy,
+        )
+        tracks = [baseline.track] if baseline.track is not None else []
+        if tracks:
+            raw, prepared = prepare_reduced(overview, source.strips(corridor_request(tracks, meta)))
+
+        def refine(candidates: list[RecoveryCandidate]) -> tuple[bytes, PreparedLCMFCapture]:
+            request = corridor_request(tracks + [c.track for c in candidates], meta)
+            return prepare_reduced(overview, source.strips(request))
+
+        return self._measure(
+            raw,
+            calibration,
+            prepared=prepared,
+            ball_speed_mph=ball_speed_mph,
+            club=club,
+            refine=refine,
+        )
+
     def process_shot(  # pylint: disable=too-many-arguments
         self,
         *,
@@ -263,34 +389,12 @@ class IWR6843Runtime:
         shot_calibration = self.calibration
         if tilt_deg is not None:
             shot_calibration = replace(self.calibration, tilt_rad=math.radians(tilt_deg))
-        prepared = prepare_lcmf_capture(capture.raw)
-        measurement = estimate_lcmf_v1(
+        measurement = self.measure_capture(
             capture.raw,
-            shot_calibration,
             ball_speed_mph=ball_speed_mph,
             club=club,
-            net_range_m=self.net_range_m,
-            tx_order=self.tx_order,
-            tdm_sign_policy=self.tdm_sign_policy,
-            horizontal_phase_reference_rad=self.horizontal_phase_reference_rad,
-            prepared=prepared,
+            calibration=shot_calibration,
         )
-        if isinstance(measurement, LCMFResult):
-            measurement = self._ops_guided_measurement(
-                capture.raw,
-                shot_calibration,
-                ball_speed_mph=ball_speed_mph,
-                club=club,
-                baseline=measurement,
-                prepared=prepared,
-            )
-        horizontal_deg = getattr(measurement, "horizontal_deg", None)
-        if horizontal_deg is not None:
-            measurement = replace(
-                measurement,
-                horizontal_deg=horizontal_deg + self.azimuth_offset_deg,
-                horizontal_raw_deg=horizontal_deg,
-            )
         self._remember_recovery_observation(measurement, ball_speed_mph)
         club_path = None
         # No OPS club speed means no identity gate to distinguish the club

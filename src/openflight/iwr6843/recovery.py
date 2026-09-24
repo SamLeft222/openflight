@@ -237,7 +237,7 @@ def find_recovery_candidates(
         geometry = prepared.geometry
     if not is_range_snapshot(vertical_meta):
         raise ValueError("recovery currently requires a range-snapshot dump")
-    max_range_m = net_range_m - 0.25 if net_range_m is not None else None
+    max_range_m = tracking.max_ball_range_m(net_range_m)
     candidates: list[RecoveryCandidate] = []
     for scope in ("burst", "window"):
         if prepared is None:

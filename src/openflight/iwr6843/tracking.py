@@ -242,6 +242,18 @@ def loop_power(mti: np.ndarray) -> np.ndarray:
     return power.reshape(n_frames * n_loops, mti.shape[-1])
 
 
+# Ball tracks stop this far short of the net: a ball riding up the net is an
+# upward mover that tilts every angle fit high.
+NET_MARGIN_M = 0.25
+
+
+def max_ball_range_m(net_range_m: float | None) -> float | None:
+    """Farthest range a ball track may use; None when the net is unset (or <= 0)."""
+    if net_range_m is None or net_range_m <= 0.0:
+        return None
+    return net_range_m - NET_MARGIN_M
+
+
 def ball_gate_bins(
     range_res_m: float,
     *,

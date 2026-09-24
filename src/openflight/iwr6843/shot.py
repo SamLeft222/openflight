@@ -401,10 +401,7 @@ def process_dump(
         prepared = prepare_shot_dump(raw, loop_period_s=loop_period_s)
     geo = prepared.geometry
     mti = prepared.mti()
-    # keep everything 25 cm short of the net: a ball riding up the net is
-    # an upward mover that tilts every angle fit high (user setup: net
-    # ~3 m past the tee)
-    max_r = (net_range_m - 0.25) if net_range_m else None
+    max_r = tracking.max_ball_range_m(net_range_m)
     klass = club_class(club)
     min_ms = CLUB_MIN_BALL_MS[klass]
     track = tracking.find_ball(

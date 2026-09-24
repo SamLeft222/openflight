@@ -161,8 +161,18 @@ class PreparedLCMFCapture:
         return self._horizontal_mti
 
 
-def prepare_lcmf_capture(raw: bytes) -> PreparedLCMFCapture:
-    """Decode and project one capture before evaluating candidate tracks."""
+def prepare_lcmf_capture(
+    raw: bytes,
+    *,
+    supplied_power: dict[str, np.ndarray] | None = None,
+    supplied_noise: dict[str, float] | None = None,
+    supplied_window_means: np.ndarray | None = None,
+) -> PreparedLCMFCapture:
+    """Decode and project one capture before evaluating candidate tracks.
+
+    The ``supplied_*`` products belong to the vertical TX pair and replace
+    what would be computed from it (see ``PreparedShotDump``).
+    """
     full_metadata, full_cube = parse_dump(raw)
     vertical_raw = project_tx_pair(raw, (0, 2)) if full_metadata["n_tx"] == 3 else raw
     tdm_tau_s = TX2_VERTICAL_TDM_TAU_S if full_metadata["n_tx"] == 3 else doa.TDM_TAU_S
@@ -170,7 +180,13 @@ def prepare_lcmf_capture(raw: bytes) -> PreparedLCMFCapture:
     return PreparedLCMFCapture(
         full_metadata=full_metadata,
         full_cube=full_cube,
-        vertical=prepare_shot_dump(vertical_raw, loop_period_s=loop_period_s),
+        vertical=prepare_shot_dump(
+            vertical_raw,
+            loop_period_s=loop_period_s,
+            supplied_power=supplied_power,
+            supplied_noise=supplied_noise,
+            supplied_window_means=supplied_window_means,
+        ),
         tdm_tau_s=tdm_tau_s,
         loop_period_s=loop_period_s,
     )
@@ -773,6 +789,30 @@ def _tx2_horizontal_proxy(
     return angle_deg, coherence, "hlcmf_v1_accepted"
 
 
+def track_capture(
+    raw: bytes,
+    cal: Calibration,
+    *,
+    prepared: PreparedLCMFCapture,
+    club: str | None = None,
+    net_range_m: float | None = None,
+    tx_order: str = "normal",
+    tdm_sign_policy: str = "positive",
+) -> ShotMeasurement:
+    """The baseline ball track that LCMF-v1 fits along."""
+    return process_dump(
+        raw,
+        cal,
+        club=club,
+        net_range_m=net_range_m,
+        tx_order=tx_order,
+        tdm_sign_policy=tdm_sign_policy,
+        loop_period_s=prepared.loop_period_s,
+        tdm_tau_s=prepared.tdm_tau_s,
+        prepared=prepared.vertical,
+    )
+
+
 def estimate_lcmf_v1(
     raw: bytes,
     cal: Calibration,
@@ -823,16 +863,14 @@ def estimate_lcmf_v1(
             tdm_sign_used=1 if tdm_sign_policy == "positive" else -1,
         )
     else:
-        shot = process_dump(
+        shot = track_capture(
             raw,
             cal,
+            prepared=prepared,
             club=club,
             net_range_m=net_range_m,
             tx_order=tx_order,
             tdm_sign_policy=tdm_sign_policy,
-            loop_period_s=loop_period_s,
-            tdm_tau_s=tdm_tau_s,
-            prepared=vertical,
         )
     if shot.track is None:
         return _result_from_track(

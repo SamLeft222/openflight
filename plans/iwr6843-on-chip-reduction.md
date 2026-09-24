@@ -17,10 +17,14 @@ ball tracker and OPS-guided track search on it, then requests only the thin
 Every tracking and estimation decision stays on the Pi, so estimator changes
 never require reflashing.
 
-| Shot type | Share | Bytes | Transfer | Today |
+Measured with the Phase 0 reference model on all 77 saved captures
+(`scripts/iwr6843/evaluate_reduced_transfer.py`):
+
+| Shot type | Captures | Bytes (median) | Transfer | Today |
 |---|---|---|---|---|
-| Baseline track | 61% | ~93 KB | ~0.9 s | 537 KB, 5.3 s |
-| OPS-guided search (up to 9 candidate strips) | 39% | ~223 KB | ~2.2 s (max ~2.7 s) | 537 KB, 5.3 s |
+| Baseline track (1 strip request) | 46 | 105 KB | ~1.0 s | 537 KB, 5.3 s |
+| OPS-guided search (2 strip requests) | 31 | 280 KB | ~2.7 s | 537 KB, 5.3 s |
+| All | 77 | | **~1.0 s median** | 5.3 s |
 
 Transfer times assume today's measured ~103 KB/s. The Pi must still wait for
 the OPS ball speed (~1.9 s) before confirming a track, so the expected
@@ -57,15 +61,19 @@ byte counts, not hardware measurements.
   captures.
 - **Overview contents** (vertical TX pair 0/2, the same data the Pi uses today):
   - burst-scope and window-scope `loop_power`, rows = frame x loop, columns =
-    gate bins only, log-encoded uint16 (`round(log2(p) * 256)`);
+    gate bins only, log-encoded int16 (`round(log2(p) * 256)`, with
+    -32768 reserved for exactly zero);
   - burst- and window-scope noise power as float32, computed exactly as
     `PreparedShotDump.noise_power` (median of `|mti|^2` over all valid bins);
-  - window-scope per-bin static means (complex, vertical pair, gate bins),
-    so the Pi can form window-scope MTI from strips (~3.4 KB);
+  - window-scope per-bin static means (complex64, vertical pair, every bin
+    any frame window holds), so the Pi can form window-scope MTI from strips
+    (~6 KB);
   - the existing per-frame descriptors (start, count, time delta) and header.
 - **Strips reuse the existing v7 variable-width timed format**, IQ8 as stored,
   all 3 TX (the horizontal proxy uses the third TX). One contiguous window per
   frame; the union of candidate corridors when several tracks are requested.
+  The format needs at least one bin per frame, so an unrequested frame carries
+  the first bin of its window.
 - **The ring stays frozen** from `l3overview` until `l3release`, or until a
   firmware timeout (proposal: 10 s) re-arms it if the Pi disappears.
 - **Gate bins are configured by the Pi** (`overviewCfg <loBin> <hiBin>`,
@@ -108,14 +116,19 @@ existing tracker, OPS-guided search, and LCMF. `find_ball` and
 
 ### Acceptance criteria
 
-- [ ] The chip model's overview and strips are packed/parsed by one
-      executable definition (like `pack_dump`), with round-trip tests.
-- [ ] With an unquantised overview, the reduced path matches the full-data
-      path bit-for-bit on every saved dump, for both MTI scopes, including
-      OPS-guided candidates in window scope.
-- [ ] With the uint16 overview, accuracy vs the R10 pairs is not worse than
-      the full-data path (typical and mean error, count within 2 deg).
-- [ ] Byte counts per shot are logged and match the budget above.
+- [x] The chip model's overview and strips are packed/parsed by one
+      executable definition (`openflight.iwr6843.reduced`), with round-trip
+      and malformed-input tests.
+- [x] With an unquantised overview, the reduced path matches the full-data
+      path bit-for-bit: 77/77 saved captures, including the 31 that ran the
+      OPS-guided search (synthetic tests cover both paths as well).
+- [x] With the int16 log overview, accuracy vs the R10 pairs is unchanged:
+      solid shots (n = 50) typical 2.16 deg, mean 3.81 deg, 24 within 2 deg,
+      9 beyond 5 deg for both paths. No status changed; angle shift median
+      0.00001 deg, p90 0.0001 deg; one capture moved 10.7 deg (a top the R10
+      read at 2.0 deg, wrong on both paths).
+- [x] Byte counts per shot are reported by
+      `scripts/iwr6843/evaluate_reduced_transfer.py` (table above).
 - [x] `project_tx_pair` preserves IQ8 values exactly; the change is covered by
       tests and its effect on the paired sessions is recorded. Replaying the
       70 paired shots (tilt 11.5): all 70 still accepted; angles moved median

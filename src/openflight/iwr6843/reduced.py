@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import math
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Protocol
 
 import numpy as np
 
@@ -36,7 +37,7 @@ from openflight.iwr6843.dump import (
     parse_dump,
     project_tx_pair,
 )
-from openflight.iwr6843.lcmf import TRACK_TIME_MARGIN_S
+from openflight.iwr6843.lcmf import TRACK_TIME_MARGIN_S, PreparedLCMFCapture, prepare_lcmf_capture
 from openflight.iwr6843.shot import TX2_LOOP_PERIOD_S, geometry_from_header, prepare_shot_dump
 from openflight.iwr6843.tracking import MTI_SCOPES, BallTrack, Geometry
 
@@ -296,6 +297,71 @@ def parse_overview(raw: bytes) -> Overview:
 
 
 # -- the Pi side -----------------------------------------------------------------
+
+
+class ReducedSource(Protocol):
+    """Where a reduced capture comes from: the radar, or a model of it."""
+
+    def overview(self) -> Overview:
+        """Freeze the ring and return its overview."""
+
+    def strips(self, request: StripRequest) -> bytes:
+        """Return the requested strips of the frozen ring."""
+
+
+@dataclass
+class CaptureReducedSource:
+    """The radar's reduced transfer, modelled from a full capture.
+
+    ``quantise=False`` hands over the overview before it is packed, so the
+    reduced path can be checked bit-for-bit against the full-capture path.
+    Byte counts are what the radar would send.
+    """
+
+    raw: bytes
+    gate: tuple[int, int]
+    quantise: bool = True
+    overview_nbytes: int = 0
+    strip_nbytes: list[int] = field(default_factory=list)
+
+    def overview(self) -> Overview:
+        """The overview as the radar would send it (or unquantised)."""
+        built = build_overview(self.raw, gate=self.gate)
+        packed = pack_overview(built)
+        self.overview_nbytes = len(packed)
+        return parse_overview(packed) if self.quantise else built
+
+    def strips(self, request: StripRequest) -> bytes:
+        """The requested strips, counting their bytes."""
+        response = serve_strips(self.raw, request)
+        self.strip_nbytes.append(len(response))
+        return response
+
+    @property
+    def total_nbytes(self) -> int:
+        """Everything sent for this shot."""
+        return self.overview_nbytes + sum(self.strip_nbytes)
+
+
+def ball_gate_for(meta: dict, net_range_m: float | None) -> tuple[int, int]:
+    """The overview gate the ball tracker needs for this capture and net."""
+    return tracking.ball_gate_bins(
+        geometry_from_header(meta).range_res_m,
+        max_range_m=tracking.max_ball_range_m(net_range_m),
+    )
+
+
+def prepare_reduced(
+    overview: Overview, strips: bytes | None = None
+) -> tuple[bytes, PreparedLCMFCapture]:
+    """The rebuilt capture and its LCMF preparation with the overview products."""
+    raw, _present = assemble_capture(overview, strips)
+    return raw, prepare_lcmf_capture(
+        raw,
+        supplied_power=overview.power,
+        supplied_noise=overview.noise,
+        supplied_window_means=overview.window_means,
+    )
 
 
 def corridor_request(
