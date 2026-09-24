@@ -96,8 +96,8 @@ byte counts, not hardware measurements.
 - **On-chip compute time** for MTI + power + two medians on the R4F is not
   measured; the estimate is tens of ms. The DSP stays unused.
 - **UART round-trip latency** for request/response is not measured.
-- **Build toolchain.** Phases 2+ need the licence-gated TI installers
-  (`firmware/ti_installers/`), which are not yet available.
+- **Build toolchain.** Resolved: the Docker toolchain builds the release
+  byte-for-byte (Phase 1).
 
 ---
 
@@ -147,9 +147,12 @@ installers are available.
 
 ### Acceptance criteria
 
-- [ ] `make -C firmware docker-build` produces an image; its behaviour matches
-      the checked-in `l3_dump_configurable_capture_20260818.bin` on a static
-      capture (same header, dimensions, and byte count).
+- [x] `make -C firmware docker-build` produces an image matching the
+      checked-in `l3_dump_configurable_capture_20260818.bin`. Verified
+      2026-09-24 on Apple Silicon (Docker Desktop 29.8, default Rosetta
+      setting): the rebuild is byte-identical (SHA-256 `823ddd18...`), so no
+      static-capture comparison is needed. Build with
+      `RELEASE_NAME=<scratch>.bin` to avoid overwriting the release.
 
 ---
 
