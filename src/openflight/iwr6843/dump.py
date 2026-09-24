@@ -337,6 +337,19 @@ def _parse_frame_metadata(raw: bytes, meta: dict) -> None:
             meta["iq8_scales"] = tuple(int(scale) for scale in scales)
 
 
+def parse_capture_metadata(raw: bytes) -> dict:
+    """Header and per-frame metadata of a dump; the payload may be absent."""
+    meta = parse_header(raw)
+    _parse_frame_metadata(raw, meta)
+    return meta
+
+
+def capture_metadata_prefix(raw: bytes) -> bytes:
+    """The header, temperature report, and per-frame tables of a dump."""
+    meta = parse_header(raw)
+    return raw[: meta["header_nbytes"] + meta.get("frame_metadata_nbytes", 0)]
+
+
 def payload_nbytes(meta: dict, raw: bytes | None = None) -> int:
     """Bytes of int16-I/Q ADC payload following the header."""
     if meta["sample_fmt"] in _VARIABLE_SAMPLE_FORMATS:

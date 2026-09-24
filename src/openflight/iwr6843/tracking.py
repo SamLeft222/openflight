@@ -155,7 +155,8 @@ def _tdm_range(cube: np.ndarray, *, range_domain: bool) -> np.ndarray:
     return tdm if range_domain else np.fft.fft(tdm, axis=-1)
 
 
-def _window_fft_size(geometry: Geometry) -> int:
+def window_fft_size(geometry: Geometry) -> int:
+    """Full range-FFT size a per-frame-windowed capture's bins index into."""
     return geometry.range_fft_size or max(
         start + geometry.frame_bin_count(frame)
         for frame, start in enumerate(geometry.range_bin_starts)
@@ -178,7 +179,7 @@ def compute_window_means(
     if geometry.range_bin_starts is None:
         raise ValueError("window means need per-frame range windows")
     rfft = _tdm_range(cube, range_domain=range_domain)
-    fft_size = _window_fft_size(geometry)
+    fft_size = window_fft_size(geometry)
     totals = np.zeros((rfft.shape[1], rfft.shape[3], fft_size), dtype=complex)
     counts = np.zeros(fft_size, dtype=float)
     for frame, start in enumerate(geometry.range_bin_starts):
@@ -239,6 +240,28 @@ def loop_power(mti: np.ndarray) -> np.ndarray:
     n_loops = mti.shape[2]
     power = (np.abs(mti) ** 2).sum(axis=(1, 3))
     return power.reshape(n_frames * n_loops, mti.shape[-1])
+
+
+def ball_gate_bins(
+    range_res_m: float,
+    *,
+    max_range_m: float | None = None,
+    gates_m: tuple[tuple[float, float], ...] = BALL_GATES_M,
+) -> tuple[int, int]:
+    """Absolute range bins [lo, hi) that ``_detections`` can read for ``gates_m``.
+
+    Mirrors the per-gate bin arithmetic below; the gates are contiguous, so
+    their union is one span. Sub-bin interpolation stays inside each gate.
+    """
+    spans = []
+    for lo_m, hi_m in gates_m:
+        if max_range_m is not None:
+            hi_m = min(hi_m, max_range_m)
+        if hi_m > lo_m:
+            spans.append((int(lo_m / range_res_m), int(hi_m / range_res_m)))
+    if not spans:
+        raise ValueError("no ball gate lies inside the maximum range")
+    return min(lo for lo, _ in spans), max(hi for _, hi in spans)
 
 
 def _detections(

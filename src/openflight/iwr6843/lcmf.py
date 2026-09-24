@@ -47,6 +47,8 @@ MAX_PER_FRAME = 4
 LATERAL_TEE_OFFSET_M = 0.064
 MPH_PER_MS = 2.23694
 HORIZONTAL_TAIL_FRAMES = 8
+# Snapshots are taken this far beyond the fitted track's first and last loop.
+TRACK_TIME_MARGIN_S = 2e-3
 HORIZONTAL_COHERENCE_MIN = 0.90
 
 # One collapsed channel must not drag the answer down. 8.0 sits in an observed
@@ -248,7 +250,11 @@ def _snapshot_cache(
     for frame in range(geometry.n_frames):
         for loop in range(geometry.n_loops):
             time_s = geometry.loop_time(frame, loop)
-            if not track.t_first - 2e-3 <= time_s <= track.t_last + 2e-3:
+            if (
+                not track.t_first - TRACK_TIME_MARGIN_S
+                <= time_s
+                <= track.t_last + TRACK_TIME_MARGIN_S
+            ):
                 continue
             range_bin = int(round(track.bin_at(time_s)))
             local_bin = geometry.local_bin(range_bin, frame)
@@ -729,7 +735,11 @@ def _tx2_horizontal_proxy(
     for frame in range(geometry.n_frames):
         for loop in range(geometry.n_loops):
             time_s = geometry.loop_time(frame, loop)
-            if not shot.track.t_first - 2e-3 <= time_s <= shot.track.t_last + 2e-3:
+            if not (
+                shot.track.t_first - TRACK_TIME_MARGIN_S
+                <= time_s
+                <= shot.track.t_last + TRACK_TIME_MARGIN_S
+            ):
                 continue
             range_bin = int(round(shot.track.bin_at(time_s)))
             local_bin = geometry.local_bin(range_bin, frame)
