@@ -144,12 +144,59 @@ class BallTrack:
         return (2.0 * q2 * t_s + q1) * range_res_m
 
 
+MTI_SCOPES = ("burst", "window")
+
+
+def _tdm_range(cube: np.ndarray, *, range_domain: bool) -> np.ndarray:
+    """Raw cube [nf, cpf, nrx, ns] -> range data [nf, 2(tx), loops, nrx, ns]."""
+    n_frames, cpf, n_rx, n_samples = cube.shape
+    tdm = cube.reshape(n_frames, cpf // 2, 2, n_rx, n_samples)
+    tdm = tdm.transpose(0, 2, 1, 3, 4)
+    return tdm if range_domain else np.fft.fft(tdm, axis=-1)
+
+
+def _window_fft_size(geometry: Geometry) -> int:
+    return geometry.range_fft_size or max(
+        start + geometry.frame_bin_count(frame)
+        for frame, start in enumerate(geometry.range_bin_starts)
+    )
+
+
+def compute_window_means(
+    cube: np.ndarray,
+    geometry: Geometry,
+    *,
+    range_domain: bool,
+) -> np.ndarray:
+    """Window-scope static means [2(tx), nrx, fft bins] for a per-frame-windowed dump.
+
+    Each absolute range bin is averaged over every loop of every frame whose
+    window holds it. In reduced-transfer mode the radar computes these from
+    the full ring and sends them, so window-scope MTI of a partial capture
+    still matches the full capture exactly.
+    """
+    if geometry.range_bin_starts is None:
+        raise ValueError("window means need per-frame range windows")
+    rfft = _tdm_range(cube, range_domain=range_domain)
+    fft_size = _window_fft_size(geometry)
+    totals = np.zeros((rfft.shape[1], rfft.shape[3], fft_size), dtype=complex)
+    counts = np.zeros(fft_size, dtype=float)
+    for frame, start in enumerate(geometry.range_bin_starts):
+        count = geometry.frame_bin_count(frame)
+        stop = start + count
+        totals[:, :, start:stop] += rfft[frame, ..., :count].sum(axis=1)
+        counts[start:stop] += rfft.shape[2]
+    counts[counts == 0] = 1.0
+    return totals / counts[None, None, :]
+
+
 def mti_filter(
     cube: np.ndarray,
     scope: str = "burst",
     *,
     range_domain: bool = False,
     geometry: Geometry | None = None,
+    window_means: np.ndarray | None = None,
 ) -> np.ndarray:
     """Raw cube [nf, cpf, nrx, ns] -> complex MTI [nf, 2(tx), loops, nrx, ns].
 
@@ -161,25 +208,20 @@ def mti_filter(
     ``scope="window"`` subtracts the mean over ALL bursts: statics are
     constant across the full 72 ms window and still cancel, while a
     notch-speed ball moves range bins across the window and survives.
+
+    ``window_means`` supplies the window-scope static means (see
+    ``compute_window_means``) instead of computing them from ``cube``.
     """
-    n_frames, cpf, n_rx, n_samples = cube.shape
-    tdm = cube.reshape(n_frames, cpf // 2, 2, n_rx, n_samples)
-    tdm = tdm.transpose(0, 2, 1, 3, 4)
-    rfft = tdm if range_domain else np.fft.fft(tdm, axis=-1)
-    if scope == "window" and geometry is not None and geometry.range_bin_starts is not None:
-        fft_size = geometry.range_fft_size or max(
-            start + geometry.frame_bin_count(frame)
-            for frame, start in enumerate(geometry.range_bin_starts)
+    windowed = geometry is not None and geometry.range_bin_starts is not None
+    if window_means is not None and (scope != "window" or not windowed):
+        raise ValueError("supplied window means need window scope and per-frame range windows")
+    rfft = _tdm_range(cube, range_domain=range_domain)
+    if scope == "window" and windowed:
+        means = (
+            window_means
+            if window_means is not None
+            else compute_window_means(cube, geometry, range_domain=range_domain)
         )
-        totals = np.zeros((tdm.shape[1], n_rx, fft_size), dtype=complex)
-        counts = np.zeros(fft_size, dtype=float)
-        for frame, start in enumerate(geometry.range_bin_starts):
-            count = geometry.frame_bin_count(frame)
-            stop = start + count
-            totals[:, :, start:stop] += rfft[frame, ..., :count].sum(axis=1)
-            counts[start:stop] += rfft.shape[2]
-        counts[counts == 0] = 1.0
-        means = totals / counts[None, None, :]
         out = np.zeros_like(rfft)
         for frame, start in enumerate(geometry.range_bin_starts):
             count = geometry.frame_bin_count(frame)
@@ -277,9 +319,10 @@ def _detections(
 
 
 def find_ball(
-    mti: np.ndarray,
+    mti: np.ndarray | None,
     geo: Geometry,
     *,
+    power: np.ndarray | None = None,
     iterations: int = 2500,
     seed: int = 1,
     max_range_m: float | None = None,
@@ -303,8 +346,14 @@ def find_ball(
     speed band overlaps the ball's, it must also pass ``time_window_s`` to
     restrict the search to pre-impact frames — otherwise this fitter will
     happily lock onto the ball instead of the club.
+
+    ``power`` supplies the per-loop power map (see ``loop_power``) instead of
+    deriving it from ``mti``; the fit reads nothing else.
     """
-    power = loop_power(mti)
+    if power is None:
+        if mti is None:
+            raise ValueError("find_ball needs mti or power")
+        power = loop_power(mti)
     loops_idx, bins = _detections(power, geo, max_range_m=max_range_m, gates_m=gates_m)
     if loops_idx.size < 8:
         return None

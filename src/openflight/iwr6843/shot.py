@@ -9,6 +9,7 @@ server's Shot dataclass comes after TrackMan blesses the numbers.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -17,7 +18,7 @@ from openflight.iwr6843 import doa, tracking, trajectory
 from openflight.iwr6843.calibration import Calibration
 from openflight.iwr6843.doa import TX2_VERTICAL_TDM_TAU_S  # noqa: F401 - re-exported
 from openflight.iwr6843.dump import is_range_snapshot, parse_dump, project_tx_pair
-from openflight.iwr6843.tracking import BallTrack, Geometry
+from openflight.iwr6843.tracking import MTI_SCOPES, BallTrack, Geometry
 from openflight.iwr6843.trajectory import TrajectoryFit
 
 DEFAULT_FRAME_PERIOD_S = 0.012  # header field is 0 on pre-v3 firmware dumps
@@ -232,18 +233,45 @@ class ShotMeasurement:
 
 @dataclass
 class PreparedShotDump:
-    """Decoded two-TX capture with lazily cached MTI products."""
+    """Decoded two-TX capture with lazily cached MTI products.
+
+    The ``supplied_*`` products replace what would otherwise be computed from
+    ``cube``. In reduced-transfer mode (plans/iwr6843-on-chip-reduction.md)
+    the radar computes them from its full ring and ``cube`` holds only strips
+    of it, so these are the only correct values.
+    """
 
     metadata: dict
     cube: np.ndarray
     geometry: Geometry
     range_domain: bool
+    supplied_power: dict[str, np.ndarray] | None = None
+    supplied_noise: dict[str, float] | None = None
+    supplied_window_means: np.ndarray | None = None
     _mti_by_scope: dict[str, np.ndarray] = field(default_factory=dict)
     _noise_by_scope: dict[str, float] = field(default_factory=dict)
+    _power_by_scope: dict[str, np.ndarray] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        geo = self.geometry
+        if self.supplied_power is not None:
+            if set(self.supplied_power) != set(MTI_SCOPES):
+                raise ValueError("supplied power needs both MTI scopes")
+            shape = (geo.n_frames * geo.n_loops, self.cube.shape[-1])
+            for scope, power in self.supplied_power.items():
+                if np.shape(power) != shape:
+                    raise ValueError(
+                        f"supplied {scope} power has shape {np.shape(power)}, not {shape}"
+                    )
+        if self.supplied_noise is not None:
+            if set(self.supplied_noise) != set(MTI_SCOPES):
+                raise ValueError("supplied noise needs both MTI scopes")
+            if not all(math.isfinite(v) and v > 0 for v in self.supplied_noise.values()):
+                raise ValueError("supplied noise power must be finite and positive")
 
     def mti(self, scope: str = "burst") -> np.ndarray:
         """Return one static-removal view, computing each scope once."""
-        if scope not in ("burst", "window"):
+        if scope not in MTI_SCOPES:
             raise ValueError("MTI scope must be burst or window")
         if scope not in self._mti_by_scope:
             self._mti_by_scope[scope] = tracking.mti_filter(
@@ -251,11 +279,22 @@ class PreparedShotDump:
                 scope=scope,
                 range_domain=self.range_domain,
                 geometry=self.geometry,
+                window_means=self.supplied_window_means if scope == "window" else None,
             )
         return self._mti_by_scope[scope]
 
+    def loop_power(self, scope: str = "burst") -> np.ndarray:
+        """Per-loop MTI power for one scope: supplied, or derived from ``mti``."""
+        if self.supplied_power is not None:
+            return self.supplied_power[scope]
+        if scope not in self._power_by_scope:
+            self._power_by_scope[scope] = tracking.loop_power(self.mti(scope))
+        return self._power_by_scope[scope]
+
     def noise_power(self, scope: str = "burst") -> float:
         """Return the invariant median noise power for one MTI scope."""
+        if self.supplied_noise is not None:
+            return float(self.supplied_noise[scope])
         if scope not in self._noise_by_scope:
             mti = self.mti(scope)
             if self.geometry.range_bin_counts is None:
@@ -302,8 +341,14 @@ def prepare_shot_dump(
     raw: bytes,
     *,
     loop_period_s: float = tracking.LOOP_PRI_S,
+    supplied_power: dict[str, np.ndarray] | None = None,
+    supplied_noise: dict[str, float] | None = None,
+    supplied_window_means: np.ndarray | None = None,
 ) -> PreparedShotDump:
-    """Decode one already-projected two-TX dump for repeated track fits."""
+    """Decode one already-projected two-TX dump for repeated track fits.
+
+    The ``supplied_*`` products are passed through to ``PreparedShotDump``.
+    """
     metadata, cube = parse_dump(raw)
     geometry = geometry_from_header(metadata, loop_period_s=loop_period_s)
     frame_values = geometry.chirps_per_frame * geometry.n_rx * geometry.n_samples
@@ -316,6 +361,9 @@ def prepare_shot_dump(
         cube=cube,
         geometry=geometry,
         range_domain=is_range_snapshot(metadata),
+        supplied_power=supplied_power,
+        supplied_noise=supplied_noise,
+        supplied_window_means=supplied_window_means,
     )
 
 
@@ -359,7 +407,9 @@ def process_dump(
     max_r = (net_range_m - 0.25) if net_range_m else None
     klass = club_class(club)
     min_ms = CLUB_MIN_BALL_MS[klass]
-    track = tracking.find_ball(mti, geo, max_range_m=max_r, min_ball_ms=min_ms)
+    track = tracking.find_ball(
+        mti, geo, power=prepared.loop_power("burst"), max_range_m=max_r, min_ball_ms=min_ms
+    )
 
     notch_used = False
     if track_broken(track) or (track is not None and near_mti_notch(track.speed_ms)):
@@ -367,7 +417,9 @@ def process_dump(
         # range walk; the window-scope filter keeps them (statics still
         # cancel over the full window)
         mti_w = prepared.mti("window")
-        track_w = tracking.find_ball(mti_w, geo, max_range_m=max_r, min_ball_ms=min_ms)
+        track_w = tracking.find_ball(
+            mti_w, geo, power=prepared.loop_power("window"), max_range_m=max_r, min_ball_ms=min_ms
+        )
         if not track_broken(track_w) and (
             track_broken(track)
             or track_w.rms_bins < track.rms_bins

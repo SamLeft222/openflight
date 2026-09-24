@@ -117,15 +117,17 @@ def _candidate_tracks_for_scope(  # pylint: disable=too-many-arguments
     ball_speed_mph: float,
     max_range_m: float | None,
     mti: np.ndarray | None = None,
+    power: np.ndarray | None = None,
 ) -> list[RecoveryCandidate]:
-    if mti is None:
-        mti = tracking.mti_filter(
-            cube,
-            scope=scope,
-            range_domain=True,
-            geometry=geometry,
-        )
-    power = tracking.loop_power(mti)
+    if power is None:
+        if mti is None:
+            mti = tracking.mti_filter(
+                cube,
+                scope=scope,
+                range_domain=True,
+                geometry=geometry,
+            )
+        power = tracking.loop_power(mti)
     loop_indices, bins = tracking._detections(  # pylint: disable=protected-access
         power,
         geometry,
@@ -258,7 +260,7 @@ def find_recovery_candidates(
                 scope=scope,
                 ball_speed_mph=ball_speed_mph,
                 max_range_m=max_range_m,
-                mti=prepared.mti(scope),
+                power=prepared.loop_power(scope),
             )
         )
     return candidates
