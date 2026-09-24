@@ -17,15 +17,23 @@ from __future__ import annotations
 import glob
 import logging
 import time
+from collections.abc import Callable
 
 import serial
 
 from openflight.iwr6843.dump import HEADER, MAGIC, parse_header, payload_nbytes
+from openflight.iwr6843.reduced import StripRequest, encode_strip_request, overview_nbytes
 
 BAUD = 1_041_667
 _PORT_GLOBS = ("/dev/ttyUSB*", "/dev/tty.SLAB_USBtoUART*")
 
 logger = logging.getLogger(__name__)
+
+
+def _dump_nbytes(buf: bytearray) -> int:
+    """Total size of a dump (or strip response) from its header and tables."""
+    metadata = parse_header(buf)
+    return metadata["header_nbytes"] + payload_nbytes(metadata, buf)
 
 
 def open_port(port: str, baud: int = BAUD, timeout: float = 0.3) -> serial.Serial:
@@ -172,8 +180,64 @@ class IWR6843Radar:
         Syncs on the ILD1 magic past the CLI echo and sizes the read from the
         dump's own header, so any firmware geometry works.
         """
+        return self._read_framed(
+            b"l3dump\n",
+            _dump_nbytes,
+            timeout_s=timeout_s,
+            stall_tolerance_s=stall_tolerance_s,
+        )
+
+    # -- reduced transfer (plans/iwr6843-on-chip-reduction.md) -----------------
+
+    def configure_overview_gate(self, gate: tuple[int, int]) -> None:
+        """Set the absolute range bins [lo, hi) the overview's power maps cover."""
+        self._require_done("overviewCfg", self.cmd(f"overviewCfg {gate[0]} {gate[1]}", 2.0))
+
+    def read_overview(self, timeout_s: float = 10.0, stall_tolerance_s: float = 4.0) -> bytes:
+        """Fire `l3overview`: freeze, return the overview, and leave the ring held."""
+        return self._read_framed(
+            b"l3overview\n",
+            overview_nbytes,
+            timeout_s=timeout_s,
+            stall_tolerance_s=stall_tolerance_s,
+            fail_on_cli_error=True,
+        )
+
+    def read_strips(
+        self,
+        request: StripRequest,
+        timeout_s: float = 10.0,
+        stall_tolerance_s: float = 4.0,
+    ) -> bytes:
+        """Fire `l3strip` on the held ring and return the strips (a timed dump)."""
+        return self._read_framed(
+            f"l3strip {encode_strip_request(request)}\n".encode(),
+            _dump_nbytes,
+            timeout_s=timeout_s,
+            stall_tolerance_s=stall_tolerance_s,
+            fail_on_cli_error=True,
+        )
+
+    def release(self) -> None:
+        """Resume capture after a held overview; harmless when nothing is held."""
+        self._require_done("l3release", self.cmd("l3release", 3.0))
+
+    def _read_framed(
+        self,
+        command: bytes,
+        size_of: Callable[[bytearray], int | None],
+        *,
+        timeout_s: float,
+        stall_tolerance_s: float,
+        fail_on_cli_error: bool = False,
+    ) -> bytes:
+        """Send ``command`` and read one ILD1-framed response sized by ``size_of``.
+
+        ``fail_on_cli_error`` raises as soon as the firmware answers with an
+        Error line instead of a response, rather than waiting out the timeout.
+        """
         self.ser.reset_input_buffer()
-        self.ser.write(b"l3dump\n")
+        self.ser.write(command)
         buf = bytearray()
         expected: int | None = None
         start = time.time()
@@ -188,11 +252,16 @@ class IWR6843Radar:
                 break
             if expected is None:
                 idx = buf.find(MAGIC)
+                if idx < 0 and fail_on_cli_error and b"Error" in buf:
+                    trailer = self._wait_for_dump_cli_ready(bytes(buf), timeout_s=0.2)
+                    raise RuntimeError(
+                        f"IWR6843 {command.decode().split()[0]} failed: "
+                        f"{trailer.decode(errors='replace').strip()}"
+                    )
                 if idx >= 0 and len(buf) - idx >= HEADER.size:
                     del buf[:idx]
                     try:
-                        metadata = parse_header(buf)
-                        expected = metadata["header_nbytes"] + payload_nbytes(metadata, buf)
+                        expected = size_of(buf)
                     except ValueError:
                         expected = None
             elif len(buf) >= expected:

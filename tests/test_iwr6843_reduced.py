@@ -370,3 +370,43 @@ def test_corridor_is_clipped_to_each_frame_window(overview):
 def test_corridor_needs_a_margin(overview):
     with pytest.raises(ValueError, match="at least one bin"):
         reduced.corridor_request([_track()], overview.metadata, width_bins=0)
+
+
+# -- wire helpers for the driver -------------------------------------------------------
+
+
+def test_strip_request_encoding():
+    assert reduced.encode_strip_request((None, (47, 1), (255, 255))) == "00002f01ffff"
+
+
+@pytest.mark.parametrize(
+    "request_, message",
+    [
+        ((None,) * (reduced.MAX_STRIP_REQUEST_FRAMES + 1), "at most"),
+        (((47, 0),), "does not fit"),
+        (((256, 1),), "does not fit"),
+        (((-1, 1),), "does not fit"),
+        (((47, 256),), "does not fit"),
+    ],
+)
+def test_unencodable_strip_requests_are_rejected(request_, message):
+    with pytest.raises(ValueError, match=message):
+        reduced.encode_strip_request(request_)
+
+
+def test_overview_size_is_known_once_its_header_arrives(overview):
+    packed = reduced.pack_overview(overview)
+    header_end = len(overview.capture_prefix) + reduced.OVERVIEW_HEADER.size
+
+    for cut in (0, 20, 44, len(overview.capture_prefix), header_end - 1):
+        assert reduced.overview_nbytes(packed[:cut]) is None, cut
+    for cut in (header_end, header_end + 100, len(packed)):
+        assert reduced.overview_nbytes(packed[:cut]) == len(packed)
+
+
+def test_overview_size_rejects_a_non_overview(overview):
+    packed = bytearray(reduced.pack_overview(overview))
+    packed[len(overview.capture_prefix)] = ord("X")
+
+    with pytest.raises(ValueError, match="magic"):
+        reduced.overview_nbytes(bytes(packed))

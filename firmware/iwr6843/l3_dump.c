@@ -53,6 +53,16 @@
 #define L3_ANY_IQ8 1
 #endif
 
+/* Reduced transfer (plans/iwr6843-on-chip-reduction.md) describes the frozen
+ * ring exactly as l3dump streams it, so it needs the timed capture streamed
+ * as stored (not compressed at dump time). */
+#if defined(CONFIGURABLE_CAPTURE) && defined(HYBRID_CADENCE_CAPTURE) && \
+    defined(SNAPSHOT_DUMP) && !defined(L3_DUMP_IQ8)
+#define L3_REDUCED_TRANSFER 1
+#include <ti/sysbios/knl/Clock.h>
+#include "reduced_overview.h"
+#endif
+
 /* --- task priorities (mirror the mmw demo): ctrl > CLI. -------------------- */
 #define L3_INIT_TASK_PRIORITY  2
 #define L3_CLI_TASK_PRIORITY   3
@@ -322,6 +332,37 @@ static int16_t g_rawFrame[2][FRAME_COMPLEX * 2];
 #define L3_HWA_PARAM_FFT_PONG   3U
 #endif
 
+#ifdef L3_REDUCED_TRANSFER
+/* l3overview freezes the ring and holds it for l3strip until l3release, or
+ * until the Pi has been silent for L3_REDUCED_HOLD_TIMEOUT_MS. */
+#define L3_REDUCED_HOLD_TIMEOUT_MS  10000U
+#define L3_REDUCED_WATCH_PERIOD_MS  100U
+/* Below the HWA rearm task: the watchdog must never delay a frame rearm. */
+#define L3_REDUCED_TASK_PRIORITY    (L3_CLI_TASK_PRIORITY - 2)
+
+static ro_work_t               gReducedWork;
+static Semaphore_Handle        gReducedLock;
+static volatile uint8_t        gReducedHeld;
+static uint32_t                gReducedHoldTick;
+static uint16_t                gOverviewGateLo;
+static uint16_t                gOverviewGateHi;
+static uint8_t                 gOverviewGateSet;
+static l3_temperature_report_t gHeldTempReport;
+static int32_t                 gHeldTempStatus = -1;
+static ro_capture_t            gHeldCapture;
+static uint8_t                 gHeldBinStart[L3_MAX_CAPTURE_FRAMES];
+static uint8_t                 gHeldBinCount[L3_MAX_CAPTURE_FRAMES];
+static uint16_t                gHeldDeltaUs[L3_MAX_CAPTURE_FRAMES];
+static uint16_t                gHeldScale[L3_MAX_CAPTURE_FRAMES];
+static const uint8_t          *gHeldFrame[L3_MAX_CAPTURE_FRAMES];
+static uint32_t                gReducedOverviews;
+static uint32_t                gReducedStrips;
+static uint32_t                gReducedReleases;
+static uint32_t                gReducedTimeouts;
+static uint32_t                gReducedErrors;
+static uint32_t                gReducedOverviewMs;
+#endif
+
 /* --- SDK handles ----------------------------------------------------------- */
 static SOC_Handle    gSocHandle;
 static UART_Handle   gCliUart;    /* MSS UARTA, instance 0, 115200, has RX */
@@ -428,6 +469,12 @@ int32_t l3_cli_dump(int32_t argc, char *argv[]);
 static int32_t l3_cli_sensorStart(int32_t argc, char *argv[]);
 static int32_t l3_cli_sensorStop(int32_t argc, char *argv[]);
 static int32_t l3_cli_stats(int32_t argc, char *argv[]);
+#ifdef L3_REDUCED_TRANSFER
+static uint8_t l3_claimReducedHold(void);
+static void l3_dropReducedHold(void);
+static void l3_registerReducedCommands(CLI_Cfg *cliCfg);
+static int32_t l3_startReducedWatch(void);
+#endif
 #ifdef CONFIGURABLE_CAPTURE
 static int32_t l3_cli_captureCfg(int32_t argc, char *argv[]);
 static int32_t l3_cli_phaseCaptureCfg(int32_t argc, char *argv[]);
@@ -452,12 +499,23 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1);
 #endif
 
 #ifdef CONFIGURABLE_CAPTURE
-static int32_t l3_parseU8(const char *text, uint8_t *value)
+static int32_t l3_parseBounded(const char *text, long maximum, long *value)
 {
     char *end = NULL;
     long parsed = strtol(text, &end, 10);
 
-    if (text == end || end == NULL || *end != '\0' || parsed < 0L || parsed > 255L) {
+    if (text == end || end == NULL || *end != '\0' || parsed < 0L || parsed > maximum) {
+        return -1;
+    }
+    *value = parsed;
+    return 0;
+}
+
+static int32_t l3_parseU8(const char *text, uint8_t *value)
+{
+    long parsed;
+
+    if (l3_parseBounded(text, 255L, &parsed) != 0) {
         return -1;
     }
     *value = (uint8_t)parsed;
@@ -2417,6 +2475,103 @@ static uint8_t l3_dumpCancelRequested(void)
     return (value == L3_DUMP_CANCEL_BYTE) ? 1U : 0U;
 }
 
+/* Header plus temperature report, as every capture transfer starts. A held
+ * capture reuses the report read when it froze, so every response from one
+ * freeze carries the same header. */
+static void l3_writeDumpHeader(l3_dump_header_t *h, uint8_t heldCapture)
+{
+    l3_temperature_report_t tempReport;
+    int32_t tempStatus;
+
+#ifdef L3_REDUCED_TRANSFER
+    if (heldCapture) {
+        tempReport = gHeldTempReport;
+        tempStatus = gHeldTempStatus;
+    } else
+#endif
+    {
+        (void)heldCapture;
+        memset((void *)&tempReport, 0, sizeof(tempReport));
+        tempStatus = l3_readTemperatureReport(&tempReport);
+    }
+    if (tempStatus == 0) {
+#ifdef CONFIGURABLE_CAPTURE
+        h->version = L3_DUMP_VERSION_CAPTURE_TEMPERATURE;
+#else
+        h->version = L3_DUMP_VERSION_TEMPERATURE;
+#endif
+    }
+    UART_writePolling(gDataUart, (uint8_t *)h, sizeof(*h));
+    if (tempStatus == 0) {
+        UART_writePolling(gDataUart, (uint8_t *)&tempReport, sizeof(tempReport));
+    }
+}
+
+#ifdef CONFIGURABLE_CAPTURE
+/* Frames a transfer of the frozen ring holds: the retained pre-trigger
+ * frames from the oldest slot, then the post-trigger frames. */
+static void l3_dumpFramePlan(uint32_t *actualPre, uint32_t *actualPost,
+                             uint32_t *oldestPre)
+{
+    *actualPre = (gPreFramesCaptured < gCapturePlan.preFrames)
+                     ? gPreFramesCaptured : gCapturePlan.preFrames;
+    *actualPost = (gPostFramesCaptured < gCapturePlan.postFrames)
+                      ? gPostFramesCaptured : gCapturePlan.postFrames;
+    *oldestPre = (gPreFramesCaptured >= gCapturePlan.preFrames)
+                     ? (gPreFramesCaptured % gCapturePlan.preFrames) : 0U;
+}
+#endif
+
+/* Restart the ring from slot zero after a transfer of a frozen capture. */
+static int32_t l3_resumeCapture(void)
+{
+#ifdef HWA_CHAINED_SNAPSHOT_RING
+    gRingFrame = 0U;
+    gHwaFreezeRequestFrame = 0U;
+    gHwaFreezeTargetFrame = 0U;
+#ifdef CONFIGURABLE_CAPTURE
+    gPreFramesCaptured = 0U;
+    gPostFramesCaptured = 0U;
+    gPostFramesObserved = 0U;
+    gPostCaptureStarted = 0U;
+    gActiveFrameIsPost = 0U;
+    gActiveFrameShouldKeep = 1U;
+#endif
+    if (l3_restartCompletedHwaFrame() < 0) {
+        CLI_write("Error: completed HWA frame restart failed\n");
+        gCaptureActive = 0U;
+        return -1;
+    }
+    gHwaFreezeRestarts++;
+#else
+    if (l3_armCapture() < 0) {
+        CLI_write("Error: EDMA re-arm failed\n");
+        gCaptureActive = 0U;
+        return -1;
+    }
+#endif
+#ifndef HWA_CHAINED_SNAPSHOT_RING
+    gRingFrame = 0U;
+#endif
+#ifdef LIVE_SNAPSHOT_RING
+    gRawFrameReadyMask = 0U;
+    gRawFrameDrops     = 0U;
+    gSnapshotFrames    = 0U;
+    gSnapshotErrors    = 0U;
+    gSnapshotBusy      = 0U;
+    gHwaFftConfigured  = 0U;
+#endif
+#ifdef HWA_CHAINED_SNAPSHOT_RING
+    gCaptureActive = 1U;
+#endif
+    if (l3_startFrontEnd() < 0) {
+        CLI_write("Error: RF restart failed\n");
+        gCaptureActive = 0U;
+        return -1;
+    }
+    return 0;
+}
+
 /* CLI "l3dump": record the current circular position, retain the configured
  * post-trigger frames, stop at that completed frame boundary, stream the ring,
  * then restart from slot zero. */
@@ -2425,6 +2580,7 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
     l3_dump_header_t h;
     uint32_t         i;
     uint8_t          dumpCancelled = 0U;
+    uint8_t          heldCapture = 0U;
 #ifdef CONFIGURABLE_CAPTURE
     uint32_t actualPre;
     uint32_t actualPost;
@@ -2432,49 +2588,33 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
 #endif
     (void)argc; (void)argv;
 
-    if (!gCaptureActive) {
-        return -1;
-    }
+#ifdef L3_REDUCED_TRANSFER
+    /* A capture frozen by l3overview streams as held, then resumes. */
+    heldCapture = l3_claimReducedHold();
+#endif
+    if (!heldCapture) {
+        if (!gCaptureActive) {
+            return -1;
+        }
 
-    /* Halt chirping only after HWA and both output EDMAs completed naturally. */
-    if (l3_stopCaptureAtBoundary() != 0) {
-        return -1;
+        /* Halt chirping only after HWA and both output EDMAs completed naturally. */
+        if (l3_stopCaptureAtBoundary() != 0) {
+            return -1;
+        }
     }
 
     /* Oldest slot = time-order start (best-effort: a frame-start ISR racing
      * the stop can skew this by one; the host cross-checks with its own
      * rotation solve). Before the first wrap the oldest data is slot 0. */
 #ifdef CONFIGURABLE_CAPTURE
-    actualPre = (gPreFramesCaptured < gCapturePlan.preFrames)
-                    ? gPreFramesCaptured : gCapturePlan.preFrames;
-    actualPost = (gPostFramesCaptured < gCapturePlan.postFrames)
-                     ? gPostFramesCaptured : gCapturePlan.postFrames;
-    oldestPre = (gPreFramesCaptured >= gCapturePlan.preFrames)
-                    ? (gPreFramesCaptured % gCapturePlan.preFrames) : 0U;
+    l3_dumpFramePlan(&actualPre, &actualPost, &oldestPre);
     l3_fill_header(&h, (uint16_t)(actualPre + actualPost), 0U);
 #else
     l3_fill_header(&h, RING_FRAMES,
                    (gRingFrame >= RING_FRAMES)
                        ? (uint16_t)(gRingFrame % RING_FRAMES) : 0U);
 #endif
-    {
-        l3_temperature_report_t tempReport;
-        int32_t tempStatus;
-
-        memset((void *)&tempReport, 0, sizeof(tempReport));
-        tempStatus = l3_readTemperatureReport(&tempReport);
-        if (tempStatus == 0) {
-#ifdef CONFIGURABLE_CAPTURE
-            h.version = L3_DUMP_VERSION_CAPTURE_TEMPERATURE;
-#else
-            h.version = L3_DUMP_VERSION_TEMPERATURE;
-#endif
-        }
-        UART_writePolling(gDataUart, (uint8_t *)&h, sizeof(h));
-        if (tempStatus == 0) {
-            UART_writePolling(gDataUart, (uint8_t *)&tempReport, sizeof(tempReport));
-        }
-    }
+    l3_writeDumpHeader(&h, heldCapture);
 #ifdef CONFIGURABLE_CAPTURE
     for (i = 0U; i < actualPre; i++) {
         uint32_t slot = (oldestPre + i) % gCapturePlan.preFrames;
@@ -2584,48 +2724,7 @@ int32_t l3_cli_dump(int32_t argc, char *argv[])
     }
 #endif
 
-#ifdef HWA_CHAINED_SNAPSHOT_RING
-    gRingFrame = 0U;
-    gHwaFreezeRequestFrame = 0U;
-    gHwaFreezeTargetFrame = 0U;
-#ifdef CONFIGURABLE_CAPTURE
-    gPreFramesCaptured = 0U;
-    gPostFramesCaptured = 0U;
-    gPostFramesObserved = 0U;
-    gPostCaptureStarted = 0U;
-    gActiveFrameIsPost = 0U;
-    gActiveFrameShouldKeep = 1U;
-#endif
-    if (l3_restartCompletedHwaFrame() < 0) {
-        CLI_write("Error: completed HWA frame restart failed\n");
-        gCaptureActive = 0U;
-        return -1;
-    }
-    gHwaFreezeRestarts++;
-#else
-    if (l3_armCapture() < 0) {
-        CLI_write("Error: EDMA re-arm failed\n");
-        gCaptureActive = 0U;
-        return -1;
-    }
-#endif
-#ifndef HWA_CHAINED_SNAPSHOT_RING
-    gRingFrame = 0U;
-#endif
-#ifdef LIVE_SNAPSHOT_RING
-    gRawFrameReadyMask = 0U;
-    gRawFrameDrops     = 0U;
-    gSnapshotFrames    = 0U;
-    gSnapshotErrors    = 0U;
-    gSnapshotBusy      = 0U;
-    gHwaFftConfigured  = 0U;
-#endif
-#ifdef HWA_CHAINED_SNAPSHOT_RING
-    gCaptureActive = 1U;
-#endif
-    if (l3_startFrontEnd() < 0) {
-        CLI_write("Error: RF restart failed\n");
-        gCaptureActive = 0U;
+    if (l3_resumeCapture() != 0) {
         return -1;
     }
     if (dumpCancelled) {
@@ -2737,6 +2836,15 @@ static int32_t l3_cli_stats(int32_t argc, char *argv[])
               (unsigned)gNumFrame, (unsigned)gNumWrap, (int)gCaptureActive,
               (unsigned)gCalibStatus, (unsigned)gRfFaults);
 #endif
+#endif
+#ifdef L3_REDUCED_TRANSFER
+    CLI_write("reduced: held=%u gate=%u-%u overviews=%u overview_ms=%u strips=%u "
+              "releases=%u timeouts=%u errors=%u\n",
+              (unsigned)gReducedHeld, (unsigned)gOverviewGateLo,
+              (unsigned)gOverviewGateHi, (unsigned)gReducedOverviews,
+              (unsigned)gReducedOverviewMs, (unsigned)gReducedStrips,
+              (unsigned)gReducedReleases, (unsigned)gReducedTimeouts,
+              (unsigned)gReducedErrors);
 #endif
     return 0;
 }
@@ -3123,6 +3231,9 @@ static int32_t l3_cli_sensorStart(int32_t argc, char *argv[])
     int16_t               mmwErr, subErr;
     int32_t               errCode;
     (void)argc; (void)argv;
+#ifdef L3_REDUCED_TRANSFER
+    l3_dropReducedHold();
+#endif
 
     if (!gSensorOpened) {
         /* Demo sends this before the first MMWave_open (board PA supply cfg);
@@ -3271,6 +3382,9 @@ static int32_t l3_cli_sensorStart(int32_t argc, char *argv[])
 static int32_t l3_cli_sensorStop(int32_t argc, char *argv[])
 {
     (void)argc; (void)argv;
+#ifdef L3_REDUCED_TRANSFER
+    l3_dropReducedHold();
+#endif
     if (!gCaptureActive) {
         return 0;
     }
@@ -3279,6 +3393,292 @@ static int32_t l3_cli_sensorStop(int32_t argc, char *argv[])
 #endif
     return l3_stopCaptureForShutdown();
 }
+
+#ifdef L3_REDUCED_TRANSFER
+/* --- Reduced transfer: l3overview / l3strip / l3release ------------------- */
+
+static void l3_reducedSink(void *ctx, const uint8_t *bytes, uint32_t count)
+{
+    (void)ctx;
+    UART_writePolling(gDataUart, (uint8_t *)bytes, count);
+}
+
+static uint32_t l3_elapsedMs(uint32_t sinceTick)
+{
+    return (uint32_t)(Clock_getTicks() - sinceTick) * (uint32_t)Clock_tickPeriod / 1000U;
+}
+
+static void l3_reducedLock(void)
+{
+    (void)Semaphore_pend(gReducedLock, BIOS_WAIT_FOREVER);
+}
+
+static void l3_reducedUnlock(void)
+{
+    Semaphore_post(gReducedLock);
+}
+
+/* Take the hold for l3dump, which streams the frozen ring and then resumes. */
+static uint8_t l3_claimReducedHold(void)
+{
+    uint8_t held;
+
+    l3_reducedLock();
+    held = gReducedHeld;
+    gReducedHeld = 0U;
+    l3_reducedUnlock();
+    return held;
+}
+
+/* sensorStart/sensorStop reconfigure or stop the front end themselves. */
+static void l3_dropReducedHold(void)
+{
+    l3_reducedLock();
+    gReducedHeld = 0U;
+    l3_reducedUnlock();
+}
+
+/* Describe the frozen ring in dump order, exactly as l3dump streams it, and
+ * read the temperature report every response from this freeze will carry. */
+static int32_t l3_describeHeldCapture(void)
+{
+    uint32_t actualPre, actualPost, oldestPre, frame;
+    uint32_t sampleBytes = l3_captureUsesIq8() ? 2U : 4U;
+
+    l3_dumpFramePlan(&actualPre, &actualPost, &oldestPre);
+    if (actualPre + actualPost == 0U) {
+        return -1;
+    }
+    for (frame = 0U; frame < actualPre + actualPost; frame++) {
+        uint32_t slot = (frame < actualPre)
+                            ? (oldestPre + frame) % gCapturePlan.preFrames
+                            : gCapturePlan.preFrames + (frame - actualPre);
+
+        if (gFrameBytes[slot] != (uint32_t)gFrameBinCount[slot] *
+                                     gCapturePlan.chirpsPerFrame * N_RX * sampleBytes) {
+            return -1;
+        }
+        gHeldBinStart[frame] = gFrameBinStart[slot];
+        gHeldBinCount[frame] = gFrameBinCount[slot];
+        gHeldDeltaUs[frame] = (frame == 0U) ? 0U : gFrameDeltaUs[slot];
+#ifdef L3_ANY_IQ8
+        gHeldScale[frame] = gFrameIq8Scale[slot];
+#else
+        gHeldScale[frame] = 1U;
+#endif
+        gHeldFrame[frame] = &g_ring[gFrameOffset[slot]];
+    }
+    gHeldCapture.n_frames = (uint16_t)(actualPre + actualPost);
+    gHeldCapture.chirps_per_frame = gCapturePlan.chirpsPerFrame;
+    gHeldCapture.n_tx = N_TX;
+    gHeldCapture.n_rx = N_RX;
+    gHeldCapture.iq8 = l3_captureUsesIq8();
+    gHeldCapture.bin_start = gHeldBinStart;
+    gHeldCapture.bin_count = gHeldBinCount;
+    gHeldCapture.delta_us = gHeldDeltaUs;
+    gHeldCapture.iq8_scale = gHeldScale;
+    gHeldCapture.frame = gHeldFrame;
+    memset((void *)&gHeldTempReport, 0, sizeof(gHeldTempReport));
+    gHeldTempStatus = l3_readTemperatureReport(&gHeldTempReport);
+    return 0;
+}
+
+/* Header (with the held temperature report) that starts every response. */
+static void l3_writeHeldHeader(void)
+{
+    l3_dump_header_t h;
+
+    l3_fill_header(&h, gHeldCapture.n_frames, 0U);
+    l3_writeDumpHeader(&h, 1U);
+}
+
+/* CLI "overviewCfg lo hi": absolute range bins [lo, hi) the overview's power
+ * maps cover. The Pi derives them from its ball gates and net distance. */
+static int32_t l3_cli_overviewCfg(int32_t argc, char *argv[])
+{
+    long lo, hi;
+
+    if (argc != 3 || l3_parseBounded(argv[1], (long)RO_BIN_SPACE, &lo) != 0 ||
+        l3_parseBounded(argv[2], (long)RO_BIN_SPACE, &hi) != 0 || lo >= hi) {
+        CLI_write("Error: overviewCfg gateLo gateHi (absolute bins, lo < hi <= %u)\n",
+                  (unsigned)RO_BIN_SPACE);
+        return -1;
+    }
+    l3_reducedLock();
+    gOverviewGateLo = (uint16_t)lo;
+    gOverviewGateHi = (uint16_t)hi;
+    gOverviewGateSet = 1U;
+    l3_reducedUnlock();
+    CLI_write("Overview gate: bins %u-%u\n", (unsigned)lo, (unsigned)hi);
+    return 0;
+}
+
+/* CLI "l3overview": freeze like l3dump, stream the overview, and hold the ring. */
+static int32_t l3_cli_overview(int32_t argc, char *argv[])
+{
+    uint32_t startTick;
+    int32_t status;
+    (void)argc; (void)argv;
+
+    l3_reducedLock();
+    if (!gOverviewGateSet) {
+        l3_reducedUnlock();
+        CLI_write("Error: send overviewCfg before l3overview\n");
+        return -1;
+    }
+    if (gReducedHeld) {
+        l3_reducedUnlock();
+        CLI_write("Error: a capture is already held; send l3release\n");
+        return -1;
+    }
+    if (!gCaptureActive || l3_stopCaptureAtBoundary() != 0) {
+        l3_reducedUnlock();
+        return -1;
+    }
+    if (l3_describeHeldCapture() != 0 ||
+        ro_check_overview(&gHeldCapture, gOverviewGateLo, gOverviewGateHi) != RO_OK) {
+        gReducedErrors++;
+        (void)l3_resumeCapture();
+        l3_reducedUnlock();
+        CLI_write("Error: frozen capture cannot be described\n");
+        return -1;
+    }
+    l3_writeHeldHeader();
+    startTick = Clock_getTicks();
+    status = ro_write_overview(&gHeldCapture, gOverviewGateLo, gOverviewGateHi,
+                               &gReducedWork, l3_reducedSink, NULL);
+    gReducedOverviewMs = l3_elapsedMs(startTick);
+    if (status != RO_OK) {
+        /* Only RO_ERR_NOISE remains, found before any overview byte. */
+        gReducedErrors++;
+        (void)l3_resumeCapture();
+        l3_reducedUnlock();
+        CLI_write("Error: overview failed (%d)\n", (int)status);
+        return -1;
+    }
+    gReducedOverviews++;
+    gReducedHeld = 1U;
+    gReducedHoldTick = Clock_getTicks();
+    l3_reducedUnlock();
+    return 0;
+}
+
+/* CLI "l3strip <hex>": 4 hex digits (start, count) per frame of the held
+ * capture, count 0 for a frame not needed. Streams the requested bins. */
+static int32_t l3_cli_strip(int32_t argc, char *argv[])
+{
+    ro_window_t request[RO_MAX_FRAMES];
+    int32_t status;
+
+    if (argc != 2) {
+        CLI_write("Error: l3strip <hex: start,count per frame>\n");
+        return -1;
+    }
+    l3_reducedLock();
+    if (!gReducedHeld) {
+        l3_reducedUnlock();
+        CLI_write("Error: no held capture; send l3overview\n");
+        return -1;
+    }
+    status = ro_parse_strip_request(argv[1], gHeldCapture.n_frames, request);
+    if (status == RO_OK) {
+        status = ro_check_strips(&gHeldCapture, request);
+    }
+    if (status != RO_OK) {
+        gReducedErrors++;
+        l3_reducedUnlock();
+        CLI_write("Error: bad strip request (%d)\n", (int)status);
+        return -1;
+    }
+    l3_writeHeldHeader();
+    (void)ro_write_strips(&gHeldCapture, request, l3_reducedSink, NULL);
+    gReducedStrips++;
+    gReducedHoldTick = Clock_getTicks();
+    l3_reducedUnlock();
+    return 0;
+}
+
+/* CLI "l3release": resume capture. Harmless when nothing is held. */
+static int32_t l3_cli_release(int32_t argc, char *argv[])
+{
+    int32_t status = 0;
+    (void)argc; (void)argv;
+
+    l3_reducedLock();
+    if (gReducedHeld) {
+        gReducedHeld = 0U;
+        gReducedReleases++;
+        status = l3_resumeCapture();
+    }
+    l3_reducedUnlock();
+    return status;
+}
+
+/* Resume a held capture the Pi has abandoned. */
+static void l3_reducedWatchTask(UArg arg0, UArg arg1)
+{
+    uint32_t periodTicks = (L3_REDUCED_WATCH_PERIOD_MS * 1000U) / (uint32_t)Clock_tickPeriod;
+    (void)arg0; (void)arg1;
+
+    for (;;) {
+        Task_sleep((periodTicks > 0U) ? periodTicks : 1U);
+        l3_reducedLock();
+        if (gReducedHeld && l3_elapsedMs(gReducedHoldTick) >= L3_REDUCED_HOLD_TIMEOUT_MS) {
+            gReducedHeld = 0U;
+            gReducedTimeouts++;
+            if (l3_resumeCapture() != 0) {
+                gReducedErrors++;
+            }
+        }
+        l3_reducedUnlock();
+    }
+}
+
+static int32_t l3_startReducedWatch(void)
+{
+    Semaphore_Params semaphoreParams;
+    Task_Params taskParams;
+
+    Semaphore_Params_init(&semaphoreParams);
+    semaphoreParams.mode = Semaphore_Mode_BINARY;
+    gReducedLock = Semaphore_create(1, &semaphoreParams, NULL);
+    if (gReducedLock == NULL) {
+        return -1;
+    }
+    Task_Params_init(&taskParams);
+    taskParams.priority = L3_REDUCED_TASK_PRIORITY;
+    taskParams.stackSize = 1024U;
+    return (Task_create(l3_reducedWatchTask, &taskParams, NULL) == NULL) ? -1 : 0;
+}
+
+/* The SDK CLI stops at the first empty table slot, so append after the last
+ * registered command whatever this build's other commands are. */
+static void l3_addCommand(CLI_Cfg *cliCfg, char *cmd, char *help, CLI_CmdHandler handler)
+{
+    uint32_t index = 0U;
+
+    while (index < CLI_MAX_CMD && cliCfg->tableEntry[index].cmd != NULL) {
+        index++;
+    }
+    if (index < CLI_MAX_CMD) {
+        cliCfg->tableEntry[index].cmd = cmd;
+        cliCfg->tableEntry[index].helpString = help;
+        cliCfg->tableEntry[index].cmdHandlerFxn = handler;
+    }
+}
+
+static void l3_registerReducedCommands(CLI_Cfg *cliCfg)
+{
+    l3_addCommand(cliCfg, "overviewCfg", "overviewCfg gateLo gateHi (absolute range bins)",
+                  l3_cli_overviewCfg);
+    l3_addCommand(cliCfg, "l3overview", "Freeze, stream the power overview, hold the ring",
+                  l3_cli_overview);
+    l3_addCommand(cliCfg, "l3strip", "l3strip <hex start,count per frame> of the held ring",
+                  l3_cli_strip);
+    l3_addCommand(cliCfg, "l3release", "Resume capture after l3overview/l3strip",
+                  l3_cli_release);
+}
+#endif
 
 /* System init task: UART, mmWave control, EDMA + ADCBUF + frame-start ISR, CLI. */
 static void l3_initTask(UArg arg0, UArg arg1)
@@ -3489,6 +3889,12 @@ static void l3_initTask(UArg arg0, UArg arg1)
     cliCfg.tableEntry[10].cmdHandlerFxn = l3_cli_iq8Scale;
 #endif
 #endif
+#endif
+#ifdef L3_REDUCED_TRANSFER
+    if (l3_startReducedWatch() != 0) {
+        return;
+    }
+    l3_registerReducedCommands(&cliCfg);
 #endif
     CLI_open(&cliCfg);
 }

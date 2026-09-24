@@ -158,22 +158,48 @@ installers are available.
 
 ## Phase 2: Firmware overview, strips, and release
 
-### What to build
+### What was built
 
-`overviewCfg`, `l3overview`, `l3strip`, and `l3release` CLI commands in
-`l3_dump.c`, matching the Phase 0 chip model byte-for-byte. The ring stays
-frozen between `l3overview` and `l3release`, with a re-arm timeout.
+* `firmware/iwr6843/reduced_overview.c/.h`: portable C89 core (no TI headers,
+  no libm) that writes the overview and strips through a byte sink. Noise
+  medians are exact (radix selection on the bits of non-negative doubles);
+  log-power codes use a generated threshold table
+  (`gen_reduced_log_table.py`). ~98 KB of working memory in MSS data RAM
+  (151 KB of 192 KB used).
+* `l3_dump.c` commands, registered after the build's last CLI entry:
+
+  | Command | Effect |
+  |---|---|
+  | `overviewCfg <lo> <hi>` | Absolute range bins [lo, hi) the power maps cover |
+  | `l3overview` | Freeze like `l3dump`, stream header + overview, **hold** the ring |
+  | `l3strip <hex>` | 4 hex digits (start, count) per frame, `0000` for none; streams a timed dump of those bins from the held ring |
+  | `l3release` | Resume capture; harmless when nothing is held |
+  | `l3dump` (held) | Streams the held ring unchanged, then resumes |
+
+  Requests are validated before any byte is streamed. `sensorStart` and
+  `sensorStop` drop a hold. A priority-1 watch task resumes a hold the Pi has
+  been silent on for 10 s. Every response from one freeze carries the
+  temperature report read at the freeze.
+* `IWR6843Radar.configure_overview_gate / read_overview / read_strips /
+  release` on the Pi; `scripts/hardware-test/test_iwr6843_reduced_transfer.py`
+  for the on-radar check.
+* Candidate image: `firmware/candidates/l3_dump_reduced_transfer_rc1.bin`
+  (not the release until this phase passes on hardware).
 
 ### Acceptance criteria
 
 - [ ] From one freeze, `l3overview` + `l3strip` output equals the Phase 0 chip
-      model applied to an `l3dump` of the same freeze.
+      model applied to an `l3dump` of the same freeze. *Off-target:* the C
+      core compiled for the host is byte-identical to `reduced.py` on all 80
+      saved field captures (overview) and on random strip requests; pending
+      the hardware script.
 - [ ] `stats` reports overview compute time, strip requests, release, and
       timeout re-arms; no HWA misses or EDMA errors across repeated cycles.
+      *Estimate:* ~2.2 M sample reads per dense overview, a few tenths of a
+      second on the 200 MHz R4F (-O3), hidden behind the OPS transfer.
 - [ ] A host that never sends `l3release` does not leave the radar frozen.
-- [ ] `l3dump` behaviour is unchanged.
-
----
+- [ ] `l3dump` behaviour is unchanged (refactored into shared header, frame
+      plan, and resume helpers; the image changes).
 
 ## Phase 3: Host integration behind a flag
 

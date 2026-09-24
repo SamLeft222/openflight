@@ -50,6 +50,8 @@ LOG_POWER_STEPS_PER_OCTAVE = 256
 ZERO_POWER_CODE = -32768
 VERTICAL_TX_PAIR = (0, 2)
 DEFAULT_STRIP_WIDTH_BINS = 1
+# l3strip carries 4 hex digits per frame on the firmware's 255-character CLI line.
+MAX_STRIP_REQUEST_FRAMES = 61
 
 # One (absolute start bin, bin count) per frame in dump order, or None for a
 # frame the Pi does not need.
@@ -242,8 +244,20 @@ def pack_overview(overview: Overview) -> bytes:
     return overview.capture_prefix + head + b"".join(body) + means.tobytes()
 
 
-def parse_overview(raw: bytes) -> Overview:
-    """Bytes -> Overview, with the power maps back in capture-local bins."""
+@dataclass(frozen=True)
+class _OverviewLayout:
+    meta: dict
+    offset: int
+    gate: tuple[int, int]
+    loops: int
+    noise: dict[str, float]
+    means_span: tuple[int, int]
+    columns: list[tuple[int, int]]
+    nbytes: int
+
+
+def _overview_layout(raw: bytes) -> _OverviewLayout:
+    """Validated overview header and total size; needs only the header bytes."""
     meta = parse_capture_metadata(raw)
     _require_timed(meta)
     offset = meta["header_nbytes"] + meta.get("frame_metadata_nbytes", 0)
@@ -262,15 +276,47 @@ def parse_overview(raw: bytes) -> Overview:
         raise ValueError(f"invalid overview gate {(lo, hi)}")
     if (means_lo, means_hi) != _means_span(meta):
         raise ValueError("overview window means do not cover the capture's range windows")
-
     columns = _gate_columns(meta, (lo, hi))
     power_values = sum(b - a for a, b in columns) * loops
+    means_values = 2 * meta["n_rx"] * (means_hi - means_lo)
+    return _OverviewLayout(
+        meta=meta,
+        offset=offset,
+        gate=(lo, hi),
+        loops=loops,
+        noise={"burst": float(noise_burst), "window": float(noise_window)},
+        means_span=(means_lo, means_hi),
+        columns=columns,
+        nbytes=offset
+        + OVERVIEW_HEADER.size
+        + len(MTI_SCOPES) * power_values * 2
+        + means_values * 8,
+    )
+
+
+def overview_nbytes(raw: bytes) -> int | None:
+    """Total size of a streamed overview, or None until its header has arrived.
+
+    Raises ValueError when the header that has arrived is not an overview.
+    """
+    try:
+        return _overview_layout(raw).nbytes
+    except ValueError as error:
+        if str(error).startswith("short"):
+            return None
+        raise
+
+
+def parse_overview(raw: bytes) -> Overview:
+    """Bytes -> Overview, with the power maps back in capture-local bins."""
+    layout = _overview_layout(raw)
+    if len(raw) != layout.nbytes:
+        raise ValueError(f"overview is {len(raw)} bytes, expected {layout.nbytes}")
+    meta, offset, loops, columns = layout.meta, layout.offset, layout.loops, layout.columns
+    means_lo, means_hi = layout.means_span
     n_rx = meta["n_rx"]
     means_values = 2 * n_rx * (means_hi - means_lo)
     body = offset + OVERVIEW_HEADER.size
-    expected = body + len(MTI_SCOPES) * power_values * 2 + means_values * 8
-    if len(raw) != expected:
-        raise ValueError(f"overview is {len(raw)} bytes, expected {expected}")
 
     n_rows = meta["n_frames"] * loops
     power = {}
@@ -289,9 +335,9 @@ def parse_overview(raw: bytes) -> Overview:
     ).reshape(2, n_rx, means_hi - means_lo)
     return Overview(
         capture_prefix=raw[:offset],
-        gate=(lo, hi),
+        gate=layout.gate,
         power=power,
-        noise={"burst": float(noise_burst), "window": float(noise_window)},
+        noise=layout.noise,
         window_means=window_means,
     )
 
@@ -362,6 +408,24 @@ def prepare_reduced(
         supplied_noise=overview.noise,
         supplied_window_means=overview.window_means,
     )
+
+
+def encode_strip_request(request: StripRequest) -> str:
+    """The l3strip argument: start and count per frame as hex, 0000 for none."""
+    if len(request) > MAX_STRIP_REQUEST_FRAMES:
+        raise ValueError(
+            f"strip requests carry at most {MAX_STRIP_REQUEST_FRAMES} frames, got {len(request)}"
+        )
+    parts = []
+    for frame, window in enumerate(request):
+        if window is None:
+            parts.append("0000")
+            continue
+        start, count = window
+        if not 0 <= start <= 255 or not 1 <= count <= 255:
+            raise ValueError(f"frame {frame} strip {window} does not fit the request format")
+        parts.append(f"{start:02x}{count:02x}")
+    return "".join(parts)
 
 
 def corridor_request(

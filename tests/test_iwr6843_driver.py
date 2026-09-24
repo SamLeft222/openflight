@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
+from test_iwr6843_pipeline import synth_shot
+from test_iwr6843_reduced import N_FRAMES, PERIOD_US, _timed_iq8
 
+from openflight.iwr6843 import reduced
 from openflight.iwr6843.driver import IWR6843Radar
 from openflight.iwr6843.dump import TEMP_REPORT_KEYS, pack_dump
 
@@ -193,3 +198,85 @@ def test_read_dump_sizes_v5_header_extension():
 
     assert dump == raw
     assert serial.writes == [b"l3dump\n"]
+
+
+# -- reduced transfer (plans/iwr6843-on-chip-reduction.md) --------------------------
+
+
+def _synthetic_capture():
+    return _timed_iq8(
+        synth_shot(
+            n_frames=N_FRAMES, n_loops=12, n_tx=3, frame_period_us=PERIOD_US, trigger_frame=0
+        )
+    )
+
+
+def test_read_overview_returns_the_overview_and_consumes_done():
+    overview = reduced.pack_overview(reduced.build_overview(_synthetic_capture(), gate=(48, 98)))
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = FakeSerial(b"l3overview\r\n" + overview + b"Done\r\nl3dump:/>")
+
+    assert radar.read_overview(timeout_s=0.5) == overview
+    assert radar.ser.writes == [b"l3overview\n"]
+    assert radar.ser.payload == bytearray()
+
+
+def test_read_overview_fails_fast_on_a_firmware_error():
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = FakeSerial(b"l3overview\r\nError: send overviewCfg before l3overview\r\n")
+    start = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="send overviewCfg"):
+        radar.read_overview(timeout_s=5.0)
+    assert time.monotonic() - start < 1.0
+
+
+def test_read_strips_sends_the_encoded_request():
+    capture = _synthetic_capture()
+    request = (None,) * 6 + ((62, 4),) * 6
+    strips = reduced.serve_strips(capture, request)
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = FakeSerial(b"echo\r\n" + strips + b"Done\r\n")
+
+    assert radar.read_strips(request, timeout_s=0.5) == strips
+    assert radar.ser.writes == [f"l3strip {reduced.encode_strip_request(request)}\n".encode()]
+
+
+def test_read_strips_fails_fast_on_a_rejected_request():
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = FakeSerial(b"Error: bad strip request (-3)\r\n")
+
+    with pytest.raises(RuntimeError, match="bad strip request"):
+        radar.read_strips((None,) * 12, timeout_s=5.0)
+
+
+def test_read_dump_keeps_waiting_past_error_text():
+    """l3dump's contract is unchanged: no early failure on CLI text."""
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = FakeSerial(b"Error: something\r\n")
+
+    assert radar.read_dump(timeout_s=0.05, stall_tolerance_s=0.01) == b"Error: something\r\n"
+
+
+def test_overview_gate_and_release_commands(monkeypatch):
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    sent = []
+
+    def fake_cmd(line, window):
+        sent.append(line)
+        return "Done\n"
+
+    monkeypatch.setattr(radar, "cmd", fake_cmd)
+
+    radar.configure_overview_gate((48, 98))
+    radar.release()
+
+    assert sent == ["overviewCfg 48 98", "l3release"]
+
+
+def test_overview_gate_rejected_by_firmware_raises(monkeypatch):
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    monkeypatch.setattr(radar, "cmd", lambda *_a: "Error: overviewCfg gateLo gateHi\n")
+
+    with pytest.raises(RuntimeError, match="overviewCfg"):
+        radar.configure_overview_gate((98, 48))
