@@ -113,10 +113,3 @@ def _isolate_profile_store(tmp_path_factory, monkeypatch):
     """Keep ProfileStore() off ~/.config/openflight/profiles.json during tests."""
     roster = tmp_path_factory.mktemp("profiles") / "profiles.json"
     monkeypatch.setenv("OPENFLIGHT_PROFILES_PATH", str(roster))
-
-
-@pytest.fixture(autouse=True)
-def _isolate_launch_history(tmp_path_factory, monkeypatch):
-    """Keep LaunchHistory() off ~/.config/openflight/launch_history.json during tests."""
-    history = tmp_path_factory.mktemp("launch_history") / "launch_history.json"
-    monkeypatch.setenv("OPENFLIGHT_LAUNCH_HISTORY_PATH", str(history))

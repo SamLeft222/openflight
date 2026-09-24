@@ -31,7 +31,6 @@ from .clubs.physics import (
     get_club_physics,
     get_club_simulation_profile,
 )
-from .launch_history import LaunchHistory
 from .launch_monitor import SPIN_CONFIDENCE_HIGH, SPIN_CONFIDENCE_RELIABLE, Shot, summarize_shots
 from .ops243 import (
     UART_BAUD_COMMANDS,
@@ -773,26 +772,19 @@ def _ensure_user_facing_launch_angles(shot: Shot) -> None:
     estimated: tuple[float, float] | None = None
 
     if shot.launch_angle_vertical is None:
-        personal = _personal_typical_launch(shot)
-        if personal is not None:
-            estimated = (personal, PERSONAL_LAUNCH_CONFIDENCE)
-            basis = "personal launch history"
-        else:
-            estimated = estimate_launch_angle(
-                shot.club,
-                shot.ball_speed_mph,
-                club_speed_mph=shot.club_speed_mph,
-                spin_rpm=shot.spin_rpm,
-            )
-            basis = "club table"
+        estimated = estimate_launch_angle(
+            shot.club,
+            shot.ball_speed_mph,
+            club_speed_mph=shot.club_speed_mph,
+            spin_rpm=shot.spin_rpm,
+        )
         shot.launch_angle_vertical = estimated[0]
         shot.launch_angle_confidence = estimated[1]
         shot.launch_angle_vertical_confidence = estimated[1]
         shot.launch_angle_vertical_source = "estimated"
         shot.angle_source = "estimated"
         logger.info(
-            "[SERVER] Angle source: estimated from %s (%.1f°, conf=%.0f%%)",
-            basis,
+            "[SERVER] Angle source: estimated (%.1f°, conf=%.0f%%)",
             estimated[0],
             estimated[1] * 100,
         )
@@ -2321,76 +2313,6 @@ VERTICAL_SPREAD_ZERO_CONFIDENCE_DEG = 10.0
 SPIN_AXIS_MIN_CONFIDENCE = 0.6
 
 
-# An LCMF result built from this few frames came from a ball echo near the
-# noise floor. On 70 R10-paired shots (2026-09-23) such readings were
-# typically 3.7 deg off with +/-13 deg misses, against 1.2 deg with more
-# frames. They are withheld only when the player's own typical launch for
-# the club exists -- the club-table estimate is worse than a weak reading.
-IWR6843_WEAK_ECHO_MAX_FRAMES = 8
-# Confidence of the player's typical launch standing in for a withheld one:
-# the ceiling of the club-table estimate, which it replaces.
-PERSONAL_LAUNCH_CONFIDENCE = 0.5
-
-
-def _iwr6843_weak_echo(measurement) -> bool:
-    n_frames = getattr(measurement, "n_frames", None)
-    return n_frames is not None and n_frames <= IWR6843_WEAK_ECHO_MAX_FRAMES
-
-
-def _personal_typical_launch(shot: Shot) -> float | None:
-    """The shot profile's typical launch for the shot club, if known."""
-    club = getattr(shot.club, "value", None)
-    if not shot.profile_id or not club:
-        return None
-    return LaunchHistory().typical_launch(shot.profile_id, club)
-
-
-def _record_personal_launch(shot: Shot, measurement, launch_deg: float) -> None:
-    """Add a strong-echo launch to the shot profile's history."""
-    club = getattr(shot.club, "value", None)
-    if (
-        not shot.profile_id
-        or not club
-        or getattr(measurement, "n_frames", None) is None
-        or _iwr6843_weak_echo(measurement)
-    ):
-        return
-    LaunchHistory().record(shot.profile_id, club, launch_deg)
-
-
-def iwr6843_launch_withheld_reason(
-    measurement, *, personal_launch_available: bool = False
-) -> str | None:
-    """Why an LCMF result the estimator accepted must not drive the shot.
-
-    Paired R10 sessions (2026-09-23, 42 shots) showed three accepted shapes
-    that were wrong almost every time, so they are withheld from the displayed
-    and carry launch angle; the shot falls back to the labelled estimate:
-
-    * single-channel results -- the other channel sat at its search-grid edge
-      or disagreed by >8 deg: 11 of 12 off by 6-34 deg;
-    * ``accepted_track_speed_warning`` -- the TI range walk disagrees with the
-      OPS ball speed and no OPS-compatible track exists: 2 of 2 off by 31-38;
-    * launch <= 0 deg -- the radar read a grounder (10.9 deg read as -2.1),
-      and the ballistic model carries any such ball exactly 0 yd.
-
-    A weak-echo result (``IWR6843_WEAK_ECHO_MAX_FRAMES`` or fewer frames) is
-    also withheld, but only when ``personal_launch_available``: the player's
-    own typical launch then replaces it.
-
-    The full measurement is still logged (iwr6843_capture) for diagnosis.
-    """
-    if getattr(measurement, "single_channel", False):
-        return "withheld_single_channel"
-    if getattr(measurement, "status", None) == "accepted_track_speed_warning":
-        return "withheld_track_speed_warning"
-    if measurement.angle_deg <= 0.0:
-        return "withheld_non_positive_launch"
-    if personal_launch_available and _iwr6843_weak_echo(measurement):
-        return "withheld_weak_echo"
-    return None
-
-
 def vertical_confidence(measurement) -> float:
     """Vertical launch confidence from channel agreement and corroboration.
 
@@ -2541,20 +2463,6 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
                 state="rejected",
                 reason="no LCMF measurement",
             )
-        elif measurement.accepted and (
-            withheld := iwr6843_launch_withheld_reason(
-                measurement,
-                personal_launch_available=_personal_typical_launch(shot) is not None,
-            )
-        ):
-            # The horizontal proxy rides the same range track, so it is
-            # withheld with the vertical angle rather than published alone.
-            logger.warning(
-                "[SERVER] IWR6843 LCMF-v1 %.2f° withheld (%s); using estimate",
-                measurement.angle_deg,
-                withheld,
-            )
-            _emit_iwr6843_trigger_status(shot, state="rejected", reason=withheld)
         elif measurement.accepted:
             shot.launch_angle_vertical = measurement.angle_deg
             # Device-level provenance is retained in iwr6843_capture. The
@@ -2563,7 +2471,6 @@ def _process_iwr6843_angle(shot: Shot) -> float | None:
             shot.launch_angle_vertical_confidence = vertical_confidence(measurement)
             shot.launch_angle_confidence = shot.launch_angle_vertical_confidence
             shot.angle_source = "radar"
-            _record_personal_launch(shot, measurement, measurement.angle_deg)
             horizontal_deg = getattr(measurement, "horizontal_deg", None)
             horizontal_confidence = getattr(measurement, "horizontal_confidence", None)
             horizontal_status = getattr(measurement, "horizontal_status", None)
