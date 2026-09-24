@@ -88,11 +88,17 @@ def pack_dump(
     range_bin_counts: tuple[int, ...] | list[int] | None = None,
     frame_time_offsets_us: tuple[int, ...] | list[int] | None = None,
     temperature_report: dict[str, int] | None = None,
+    iq8_scales: tuple[int, ...] | list[int] | None = None,
 ) -> bytes:
     """Complex cube [n_frames, chirps_per_frame, n_rx, n_samples] -> dump bytes.
 
     Reference packer: this is the exact byte layout the firmware must emit, and
     the synthesis/test path uses it so the format has one executable definition.
+
+    ``iq8_scales`` fixes each IQ8 frame's scale instead of deriving it from the
+    frame's peak. Repacking samples that already came from an IQ8 dump with
+    their stored scales is lossless; a sample that does not fit its scale's
+    int8 range raises instead of clipping.
     """
     n_frames, cpf, n_rx, n_samples = cube.shape
     if sample_fmt not in (
@@ -189,19 +195,31 @@ def pack_dump(
     else:
         flat = cube.reshape(-1)
     if sample_fmt == SAMPLE_RANGE_FFT_IQ8_VARIABLE_TIMED:
+        if iq8_scales is not None and (
+            len(iq8_scales) != n_frames or any(not 1 <= int(s) <= 0xFFFF for s in iq8_scales)
+        ):
+            raise ValueError("IQ8 scale table needs one uint16 scale >= 1 per frame")
         scales: list[int] = []
         chunks: list[bytes] = []
         for frame, count in enumerate(range_bin_counts):
             frame_flat = cube[frame, ..., :count].reshape(-1)
-            max_abs = max(
-                float(np.max(np.abs(frame_flat.real), initial=0.0)),
-                float(np.max(np.abs(frame_flat.imag), initial=0.0)),
-            )
-            scale = max(1, int(np.ceil(max_abs / 127.0)))
+            if iq8_scales is None:
+                max_abs = max(
+                    float(np.max(np.abs(frame_flat.real), initial=0.0)),
+                    float(np.max(np.abs(frame_flat.imag), initial=0.0)),
+                )
+                scale = max(1, int(np.ceil(max_abs / 127.0)))
+            else:
+                scale = int(iq8_scales[frame])
             scales.append(scale)
+            codes_im = np.round(frame_flat.imag / scale)
+            codes_re = np.round(frame_flat.real / scale)
+            codes = np.concatenate([codes_im, codes_re])
+            if iq8_scales is not None and np.any((codes < -128) | (codes > 127)):
+                raise ValueError(f"frame {frame} does not fit its IQ8 scale {scale}")
             iq8 = np.empty(frame_flat.size * 2, dtype=np.int8)
-            iq8[0::2] = np.clip(np.round(frame_flat.imag / scale), -128, 127).astype(np.int8)
-            iq8[1::2] = np.clip(np.round(frame_flat.real / scale), -128, 127).astype(np.int8)
+            iq8[0::2] = np.clip(codes_im, -128, 127).astype(np.int8)
+            iq8[1::2] = np.clip(codes_re, -128, 127).astype(np.int8)
             chunks.append(iq8.tobytes())
         scale_prefix = np.asarray(scales, dtype="<u2").tobytes()
         return hdr + temp_prefix + frame_prefix + scale_prefix + b"".join(chunks)
@@ -438,6 +456,9 @@ def project_tx_pair(raw: bytes, tx_indices: tuple[int, int] = (0, 1)) -> bytes:
     capture builds may store an extra TX for horizontal/aim work; this helper
     keeps the full raw dump on disk while letting the existing vertical pipeline
     operate on a deterministic TX pair.
+
+    The projection is lossless: IQ8 frames keep their stored scales rather than
+    being re-quantised to the kept pair's peak.
     """
     meta, cube = parse_dump(raw)
     n_tx = meta["n_tx"]
@@ -470,6 +491,7 @@ def project_tx_pair(raw: bytes, tx_indices: tuple[int, int] = (0, 1)) -> bytes:
         range_bin_counts=meta.get("range_bin_counts"),
         frame_time_offsets_us=meta.get("frame_time_offsets_us"),
         temperature_report=meta.get("temperature_report"),
+        iq8_scales=meta.get("iq8_scales"),
     )
 
 

@@ -116,8 +116,12 @@ existing tracker, OPS-guided search, and LCMF. `find_ball` and
 - [ ] With the uint16 overview, accuracy vs the R10 pairs is not worse than
       the full-data path (typical and mean error, count within 2 deg).
 - [ ] Byte counts per shot are logged and match the budget above.
-- [ ] `project_tx_pair` preserves IQ8 values exactly; the change is covered by
-      tests and its effect on the paired sessions is recorded.
+- [x] `project_tx_pair` preserves IQ8 values exactly; the change is covered by
+      tests and its effect on the paired sessions is recorded. Replaying the
+      70 paired shots (tilt 11.5): all 70 still accepted; angles moved median
+      0.43 deg, p90 5.0 deg, max 12.3 deg. Solid shots vs R10 (n = 50):
+      typical 2.03 -> 2.16 deg, mean 4.00 -> 3.81 deg, within 2 deg 25 -> 24,
+      beyond 5 deg 8 -> 9 -- no net accuracy change.
 
 ---
 

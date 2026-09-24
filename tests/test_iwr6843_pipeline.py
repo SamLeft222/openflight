@@ -374,6 +374,74 @@ def test_iq8_timed_snapshot_halves_payload_and_restores_scale():
         )
 
 
+def test_iq8_tx_projection_keeps_stored_samples_exactly():
+    """Projecting an IQ8 dump must not re-quantise it.
+
+    The projection used to re-derive each frame's IQ8 scale from the kept TX
+    pair. When the dropped TX held the frame's peak, the new scale was smaller
+    and every sample was rounded again: on 62 R10-paired shots (2026-09-24)
+    that alone moved launch angles by 0.25 deg median and up to 7.8 deg.
+    """
+    rng = np.random.default_rng(91)
+    starts, counts, offsets_us = (20, 32, 47), (5, 6, 7), (0, 2000, 4000)
+    scale = 128
+    shape = (3, 36, 4, 7)
+    codes = rng.integers(-40, 41, size=shape) + 1j * rng.integers(-40, 41, size=shape)
+    codes[:, 1::3, 0, 0] = 127 + 127j  # TX1 (chirp % 3 == 1) holds every frame's peak
+    raw = pack_dump(
+        codes * scale,
+        n_tx=3,
+        version=6,
+        frame_period_us=2000,
+        sample_fmt=SAMPLE_RANGE_FFT_IQ8_VARIABLE_TIMED,
+        range_bin_starts=starts,
+        range_bin_counts=counts,
+        frame_time_offsets_us=offsets_us,
+    )
+    meta, parsed = parse_dump(raw)
+    assert meta["iq8_scales"] == (scale,) * 3
+
+    projected_meta, projected = parse_dump(project_tx_pair(raw, (0, 2)))
+
+    kept = parsed.reshape(3, 12, 3, 4, 7)[:, :, [0, 2]].reshape(3, 24, 4, 7)
+    assert projected_meta["iq8_scales"] == meta["iq8_scales"]
+    for frame, count in enumerate(counts):
+        np.testing.assert_array_equal(projected[frame, ..., :count], kept[frame, ..., :count])
+
+
+def test_iq8_pack_rejects_samples_that_do_not_fit_a_given_scale():
+    cube = np.full((1, 6, 4, 3), 200 * 16 + 0j)
+    with pytest.raises(ValueError, match="frame 0"):
+        pack_dump(
+            cube,
+            n_tx=3,
+            version=6,
+            frame_period_us=2000,
+            sample_fmt=SAMPLE_RANGE_FFT_IQ8_VARIABLE_TIMED,
+            range_bin_starts=(20,),
+            range_bin_counts=(3,),
+            frame_time_offsets_us=(0,),
+            iq8_scales=(16,),
+        )
+
+
+@pytest.mark.parametrize("scales", [(128,), (128, 128, 128), (0, 128), (70000, 128)])
+def test_iq8_pack_rejects_malformed_scale_tables(scales):
+    cube = np.zeros((2, 6, 4, 3), dtype=complex)
+    with pytest.raises(ValueError, match="IQ8 scale"):
+        pack_dump(
+            cube,
+            n_tx=3,
+            version=6,
+            frame_period_us=2000,
+            sample_fmt=SAMPLE_RANGE_FFT_IQ8_VARIABLE_TIMED,
+            range_bin_starts=(20, 20),
+            range_bin_counts=(3, 3),
+            frame_time_offsets_us=(0, 2000),
+            iq8_scales=scales,
+        )
+
+
 def test_windowed_snapshot_temperature_report_round_trip_and_projection():
     rng = np.random.default_rng(24)
     starts = (20, 20, 32, 32)
