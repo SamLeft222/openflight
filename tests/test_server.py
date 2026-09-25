@@ -4858,3 +4858,183 @@ class TestBallisticCarryPrecedence:
         resolved = server_module.resolve_shot(forwarded[0], server_module.SimPlayerState())
         assert resolved.carry_yards == pytest.approx(shot.carry_spin_adjusted)
         assert resolved.carry_yards > 135.0
+
+
+class TestCameraAnalysisSwitch:
+    """--camera-analysis off keeps capture and replay but skips the slow analysis."""
+
+    @staticmethod
+    def _shot(horizontal_deg=-2.0):
+        return Shot(
+            ball_speed_mph=110.0,
+            timestamp=datetime.now(),
+            launch_angle_horizontal=horizontal_deg,
+            launch_angle_horizontal_confidence=0.7,
+            launch_angle_horizontal_source="radar",
+            iwr6843_horizontal_deg=horizontal_deg,
+            iwr6843_horizontal_confidence=0.7,
+        )
+
+    @pytest.mark.parametrize(
+        ("arguments", "expected"),
+        [([], True), (["--camera-analysis", "on"], True), (["--camera-analysis", "off"], False)],
+    )
+    def test_cli_camera_analysis_switch(self, arguments, expected):
+        parser = argparse.ArgumentParser()
+        server_module._add_camera_analysis_arguments(parser)
+
+        assert (parser.parse_args(arguments).camera_analysis == "on") is expected
+
+    def test_cli_rejects_unknown_camera_analysis_value(self):
+        parser = argparse.ArgumentParser()
+        server_module._add_camera_analysis_arguments(parser)
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--camera-analysis", "maybe"])
+
+    def test_init_records_the_analysis_switch(self, monkeypatch, tmp_path):
+        from openflight.camera import capture_runtime  # noqa: PLC0415
+
+        class FakeRuntime:
+            def __init__(self, *, output_dir, settings, use_gpio_trigger):
+                self.settings = settings
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(capture_runtime, "CameraCaptureRuntime", FakeRuntime)
+        for name in (
+            "camera_capture_runtime",
+            "camera_capture_config",
+            "camera_replay_manager",
+            "camera_reference_ball_tracker",
+            "camera_ball_flight_reference_tracker",
+        ):
+            monkeypatch.setattr(server_module, name, getattr(server_module, name))
+
+        assert server_module.init_camera_capture(
+            output_dir=tmp_path,
+            gpio_pin=17,
+            width=640,
+            height=400,
+            fps=600.0,
+            pre_ms=150.0,
+            post_ms=150.0,
+            exposure_us=500,
+            gain=2.0,
+            stream="raw",
+            rotate_180=False,
+            mirror_horizontal=False,
+            roll_correction_deg=0.0,
+            scaler_crop=None,
+            mount_height_m=0.2,
+            lateral_offset_m=0.0,
+            horizontal_offset_deg=0.0,
+            use_gpio_trigger=False,
+            analysis_enabled=False,
+        )
+        assert server_module.camera_capture_config["analysis_enabled"] is False
+
+    def test_analysis_is_on_by_default(self, monkeypatch):
+        monkeypatch.setattr(server_module, "camera_capture_config", {"enabled": True})
+        monkeypatch.setattr(server_module, "camera_capture_runtime", None)
+        called = []
+        monkeypatch.setattr(
+            server_module, "_load_camera_capture_archive", lambda _c: called.append(1)
+        )
+        monkeypatch.setattr(server_module, "_fuse_camera_ball_flight", lambda *_a: None)
+        monkeypatch.setattr(server_module, "_fuse_camera_club_delivery", lambda *_a: None)
+
+        server_module._fuse_camera_measurements(self._shot(), SimpleNamespace(valid=True))
+
+        assert called == [1]
+
+    def test_off_skips_decoding_and_both_estimators(self, monkeypatch):
+        monkeypatch.setattr(
+            server_module, "camera_capture_config", {"enabled": True, "analysis_enabled": False}
+        )
+        monkeypatch.setattr(server_module, "camera_capture_runtime", None)
+        monkeypatch.setattr(
+            server_module,
+            "_load_camera_capture_archive",
+            lambda _c: pytest.fail("frames must not be decoded with analysis off"),
+        )
+        monkeypatch.setattr(
+            "openflight.camera.ball_flight.estimate_camera_ball_flight",
+            lambda *_a, **_k: pytest.fail("ball flight must not be estimated with analysis off"),
+        )
+        monkeypatch.setattr(
+            server_module,
+            "_fuse_camera_club_delivery",
+            lambda *_a: pytest.fail("club delivery must not run with analysis off"),
+        )
+        shot = self._shot()
+
+        server_module._fuse_camera_measurements(shot, SimpleNamespace(valid=True, path="/x"))
+
+        assert shot.launch_angle_horizontal == -2.0
+        assert shot.launch_angle_horizontal_confidence == 0.7
+        assert shot.launch_angle_horizontal_source == "radar"
+        assert shot.experimental_camera_horizontal_deg is None
+        assert shot.experimental_camera_horizontal_confidence is None
+        assert shot.experimental_camera_iwr_delta_deg is None
+        assert shot.experimental_camera_horizontal_status == (
+            "camera_withheld_fallback_iwr:skipped_analysis_off"
+        )
+        assert shot.experimental_fused_status == "skipped_analysis_off"
+        assert shot.experimental_fused_attack_angle_deg is None
+        assert shot.experimental_fused_club_path_deg is None
+        assert shot.experimental_fused_attack_angle_confidence == "withheld"
+        assert shot.experimental_fused_club_path_confidence == "withheld"
+
+    @pytest.mark.parametrize("horizontal_deg", [-2.0, 19.5, 24.0, -30.0, None])
+    def test_off_applies_the_same_iwr_fallback_as_no_camera(self, monkeypatch, horizontal_deg):
+        """Skipping must not change the horizontal a shot would get without a camera."""
+        monkeypatch.setattr(server_module, "camera_capture_runtime", None)
+        without_camera = self._shot(horizontal_deg)
+        server_module._fuse_camera_ball_flight(without_camera, None)
+        monkeypatch.setattr(
+            server_module, "camera_capture_config", {"enabled": True, "analysis_enabled": False}
+        )
+        skipped = self._shot(horizontal_deg)
+
+        server_module._fuse_camera_measurements(skipped, SimpleNamespace(valid=True))
+
+        for field in (
+            "launch_angle_horizontal",
+            "launch_angle_horizontal_confidence",
+            "launch_angle_horizontal_source",
+        ):
+            assert getattr(skipped, field) == getattr(without_camera, field), field
+
+    def test_off_wins_over_the_lighting_check(self, monkeypatch):
+        monkeypatch.setattr(
+            server_module, "camera_capture_config", {"enabled": True, "analysis_enabled": False}
+        )
+        monkeypatch.setattr(
+            server_module, "camera_capture_runtime", SimpleNamespace(camera_analysis_eligible=False)
+        )
+        shot = self._shot()
+
+        server_module._fuse_camera_measurements(shot, SimpleNamespace(valid=True))
+
+        assert shot.experimental_fused_status == "skipped_analysis_off"
+
+    def test_off_still_attaches_the_replay(self, monkeypatch, tmp_path):
+        registered = []
+        monkeypatch.setattr(
+            server_module,
+            "camera_replay_manager",
+            SimpleNamespace(register=lambda path, meta: registered.append(path) or {"id": "r1"}),
+        )
+        monkeypatch.setattr(
+            server_module, "camera_capture_config", {"enabled": True, "analysis_enabled": False}
+        )
+        shot = self._shot()
+
+        server_module._attach_camera_replay(
+            shot, SimpleNamespace(valid=True, path=str(tmp_path), metadata={})
+        )
+
+        assert registered == [str(tmp_path)]
+        assert shot.camera_replay == {"id": "r1"}

@@ -1005,8 +1005,13 @@ def init_camera_capture(
     lateral_offset_m: float,
     horizontal_offset_deg: float,
     use_gpio_trigger: bool,
+    analysis_enabled: bool = True,
 ) -> bool:
-    """Initialize passive high-speed camera capture for offline alignment."""
+    """Initialize passive high-speed camera capture for offline alignment.
+
+    ``analysis_enabled=False`` keeps capture and replay but skips the live
+    camera estimators (about 9 s per shot on the Pi).
+    """
     global camera_capture_runtime, camera_capture_config  # pylint: disable=global-statement
     global camera_replay_manager  # pylint: disable=global-statement
     global camera_reference_ball_tracker  # pylint: disable=global-statement
@@ -1073,6 +1078,7 @@ def init_camera_capture(
             "horizontal_offset_deg": horizontal_offset_deg,
             "alignment_x_pct": 50.0,
             "alignment_y_pct": 50.0,
+            "analysis_enabled": analysis_enabled,
         }
         logger.info("[SERVER] Camera capture initialized: %s", camera_capture_config)
         return True
@@ -2736,6 +2742,49 @@ def _fuse_camera_club_delivery(
         )
 
 
+def _apply_camera_horizontal_decision(shot: Shot, estimate) -> None:
+    """Record a camera ball-flight estimate and select the shot's horizontal.
+
+    A withheld estimate leaves the IWR horizontal in place (subject to the
+    IWR fallback limits in ``select_camera_assisted_horizontal``).
+    """
+    from openflight.camera.ball_flight import (  # noqa: PLC0415
+        select_camera_assisted_horizontal,
+    )
+
+    decision = select_camera_assisted_horizontal(
+        estimate,
+        iwr_horizontal_deg=shot.iwr6843_horizontal_deg,
+        iwr_confidence=shot.iwr6843_horizontal_confidence,
+    )
+    shot.experimental_camera_horizontal_deg = decision.camera_horizontal_deg
+    shot.experimental_camera_horizontal_confidence = (
+        decision.confidence
+        if decision.source in ("camera_assisted_experimental", "camera_only_experimental")
+        else None
+    )
+    shot.experimental_camera_horizontal_status = (
+        decision.status
+        if estimate.confidence_tier != "withheld"
+        else f"{decision.status}:{estimate.status}"
+    )
+    shot.experimental_camera_iwr_delta_deg = decision.camera_iwr_delta_deg
+    if decision.selected_deg is not None:
+        shot.launch_angle_horizontal = decision.selected_deg
+        shot.launch_angle_horizontal_confidence = decision.confidence
+        shot.launch_angle_horizontal_source = decision.source
+    logger.info(
+        "[SERVER] Camera-assisted horizontal: selected=%s camera=%s IWR=%s "
+        "delta=%s status=%s support=%d/27",
+        decision.selected_deg,
+        decision.camera_horizontal_deg,
+        decision.iwr_horizontal_deg,
+        decision.camera_iwr_delta_deg,
+        decision.status,
+        estimate.support,
+    )
+
+
 def _fuse_camera_ball_flight(
     shot: Shot,
     camera_capture,
@@ -2747,7 +2796,6 @@ def _fuse_camera_ball_flight(
             CameraBallEstimate,
             CameraBallGeometry,
             estimate_camera_ball_flight,
-            select_camera_assisted_horizontal,
         )
 
         estimate = CameraBallEstimate(status="rejected_no_camera_capture")
@@ -2801,37 +2849,7 @@ def _fuse_camera_ball_flight(
                             ball_tracker=camera_ball_flight_reference_tracker,
                         )
 
-        decision = select_camera_assisted_horizontal(
-            estimate,
-            iwr_horizontal_deg=shot.iwr6843_horizontal_deg,
-            iwr_confidence=shot.iwr6843_horizontal_confidence,
-        )
-        shot.experimental_camera_horizontal_deg = decision.camera_horizontal_deg
-        shot.experimental_camera_horizontal_confidence = (
-            decision.confidence
-            if decision.source in ("camera_assisted_experimental", "camera_only_experimental")
-            else None
-        )
-        shot.experimental_camera_horizontal_status = (
-            decision.status
-            if estimate.confidence_tier != "withheld"
-            else f"{decision.status}:{estimate.status}"
-        )
-        shot.experimental_camera_iwr_delta_deg = decision.camera_iwr_delta_deg
-        if decision.selected_deg is not None:
-            shot.launch_angle_horizontal = decision.selected_deg
-            shot.launch_angle_horizontal_confidence = decision.confidence
-            shot.launch_angle_horizontal_source = decision.source
-        logger.info(
-            "[SERVER] Camera-assisted horizontal: selected=%s camera=%s IWR=%s "
-            "delta=%s status=%s support=%d/27",
-            decision.selected_deg,
-            decision.camera_horizontal_deg,
-            decision.iwr_horizontal_deg,
-            decision.camera_iwr_delta_deg,
-            decision.status,
-            estimate.support,
-        )
+        _apply_camera_horizontal_decision(shot, estimate)
     except Exception as error:  # pylint: disable=broad-exception-caught
         shot.experimental_camera_horizontal_status = "error"
         logger.warning("[SERVER] Camera ball-flight fusion error: %s", error, exc_info=True)
@@ -2843,8 +2861,36 @@ def _fuse_camera_ball_flight(
         )
 
 
+CAMERA_ANALYSIS_SKIPPED_STATUS = "skipped_analysis_off"
+
+
+def _withhold_camera_club_delivery(shot: Shot, status: str) -> None:
+    shot.experimental_fused_attack_angle_deg = None
+    shot.experimental_fused_club_path_deg = None
+    shot.experimental_fused_status = status
+    shot.experimental_fused_attack_angle_confidence = "withheld"
+    shot.experimental_fused_club_path_confidence = "withheld"
+
+
+def _skip_camera_analysis(shot: Shot) -> None:
+    """--camera-analysis off: radar-only angles, exactly as with no camera."""
+    try:
+        from openflight.camera.ball_flight import CameraBallEstimate  # noqa: PLC0415
+
+        _apply_camera_horizontal_decision(
+            shot, CameraBallEstimate(status=CAMERA_ANALYSIS_SKIPPED_STATUS)
+        )
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        shot.experimental_camera_horizontal_status = "error"
+        logger.warning("[SERVER] Camera analysis skip error: %s", error, exc_info=True)
+    _withhold_camera_club_delivery(shot, CAMERA_ANALYSIS_SKIPPED_STATUS)
+
+
 def _fuse_camera_measurements(shot: Shot, camera_capture) -> None:
     """Decode one camera clip and share it across all live estimators."""
+    if not camera_capture_config.get("analysis_enabled", True):
+        _skip_camera_analysis(shot)
+        return
     captured_auto_exposure = (
         camera_capture.metadata.get("auto_exposure")
         if camera_capture is not None
@@ -2865,11 +2911,7 @@ def _fuse_camera_measurements(shot: Shot, camera_capture) -> None:
         shot.experimental_camera_horizontal_deg = None
         shot.experimental_camera_horizontal_confidence = None
         shot.experimental_camera_iwr_delta_deg = None
-        shot.experimental_fused_attack_angle_deg = None
-        shot.experimental_fused_club_path_deg = None
-        shot.experimental_fused_status = "rejected_lighting_quality"
-        shot.experimental_fused_attack_angle_confidence = "withheld"
-        shot.experimental_fused_club_path_confidence = "withheld"
+        _withhold_camera_club_delivery(shot, "rejected_lighting_quality")
         logger.warning(
             "[SERVER] Camera analysis withheld for lighting quality; using radar fallback"
         )
@@ -4306,6 +4348,19 @@ def _add_battery_arguments(parser):
     )
 
 
+def _add_camera_analysis_arguments(parser):
+    """Add the switch for the live camera estimators."""
+    parser.add_argument(
+        "--camera-analysis",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "Run the live camera ball-flight and club-delivery estimators (off keeps "
+            "capture and replay, uses radar-only angles, and saves ~9 s per shot)"
+        ),
+    )
+
+
 def _apply_kld7_device_defaults(args, dev_root: Path = Path("/dev")) -> None:
     """Preserve kiosk symlink discovery while keeping CLI policy in the server."""
     vertical = dev_root / "kld7_vertical"
@@ -4451,6 +4506,7 @@ def main():
     )
     parser.add_argument("--no-logging", action="store_true", help="Disable session logging")
     _add_battery_arguments(parser)
+    _add_camera_analysis_arguments(parser)
     parser.add_argument(
         "--sim",
         action="store_true",
@@ -4925,6 +4981,7 @@ def main():
             mirror_horizontal=args.camera_capture_mirror_horizontal,
             scaler_crop=camera_capture_scaler_crop,
             use_gpio_trigger=not args.iwr6843,
+            analysis_enabled=args.camera_analysis == "on",
         ):
             print("Camera capture unavailable - running without high-speed camera capture")
             startup_status.skip("camera", "High-speed camera unavailable; continuing")
