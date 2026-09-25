@@ -72,11 +72,19 @@ class IWR6843Capture:
 
 @dataclass
 class _Hold:
-    """The capture whose frozen ring the radar is holding."""
+    """The capture whose frozen ring the radar is holding.
+
+    ``done`` wakes the capture thread: set when the hold is finished, or when
+    the OPS rejects the sound (``rejected``) so the thread releases it now.
+    A capture ``claimed`` by a shot is never released by a rejection.
+    """
 
     sequence: int
+    edge_timestamp: float
     done: threading.Event
     finished: bool = False
+    rejected: bool = False
+    claimed: bool = False
 
 
 class IWR6843CaptureMonitor:
@@ -127,6 +135,8 @@ class IWR6843CaptureMonitor:
         self.hold_budget_s = hold_budget_s
         self._serial_lock = threading.Lock()
         self._hold: _Hold | None = None
+        # Edges the OPS rejected before their capture completed.
+        self._rejected_edges: deque[float] = deque(maxlen=16)
 
     @property
     def port(self) -> str:
@@ -280,7 +290,9 @@ class IWR6843CaptureMonitor:
             path = self._capture_path(sequence, edge_timestamp, ".overview")
             path.write_bytes(overview)
         with self._serial_lock:
-            self._hold = _Hold(sequence=sequence, done=threading.Event())
+            self._hold = _Hold(
+                sequence=sequence, edge_timestamp=edge_timestamp, done=threading.Event()
+            )
         return {"overview": overview, "path": path, "metadata": metadata, "transfer": "reduced"}
 
     def read_strips(self, capture: IWR6843Capture, request: StripRequest) -> bytes:
@@ -330,16 +342,20 @@ class IWR6843CaptureMonitor:
         hold = self._hold
         if hold is None or hold.sequence != sequence:
             return
-        if hold.done.wait(self.hold_budget_s):
-            return
+        hold.done.wait(self.hold_budget_s)
         with self._serial_lock:
             if hold.finished:
                 return
-            logger.warning(
-                "[IWR6843] Capture #%d was not finished within %.1fs; releasing the radar",
-                sequence,
-                self.hold_budget_s,
-            )
+            if hold.rejected:
+                logger.info(
+                    "[IWR6843] Capture #%d: the OPS found no shot; releasing the radar", sequence
+                )
+            else:
+                logger.warning(
+                    "[IWR6843] Capture #%d was not finished within %.1fs; releasing the radar",
+                    sequence,
+                    self.hold_budget_s,
+                )
             try:
                 self.radar.release()
             except Exception:  # pylint: disable=broad-exception-caught
@@ -398,7 +414,10 @@ class IWR6843CaptureMonitor:
                 fallback_reason=result.get("fallback_reason"),
             )
             with self._condition:
-                self._captures.append(capture)
+                if self._take_rejection(edge_timestamp):
+                    self._reject_hold(sequence)
+                else:
+                    self._captures.append(capture)
                 self._condition.notify_all()
             # A held ring cannot capture another shot: keep new edges out until
             # the runtime finishes this capture (or its budget runs out).
@@ -417,6 +436,58 @@ class IWR6843CaptureMonitor:
                 capture.dump_duration_s,
             )
 
+    def discard_trigger(self, timestamp: float | None) -> bool:
+        """The OPS found no shot for the sound at ``timestamp``: free its capture.
+
+        The matching capture is dropped and, if the radar is holding its ring,
+        the capture thread releases it at once instead of after the hold
+        budget. A capture still being read is released when it arrives. A
+        capture already claimed by a shot is left alone. Never touches the
+        radar itself, so it is safe to call from the OPS thread. Returns
+        whether a completed capture matched.
+        """
+        if timestamp is None:
+            return False
+        timestamp = float(timestamp)
+        with self._condition:
+            matched = [
+                capture
+                for capture in self._captures
+                if abs(capture.trigger_timestamp - timestamp) <= self.match_tolerance_s
+            ]
+            for capture in matched:
+                self._captures.remove(capture)
+                logger.info(
+                    "[IWR6843] Capture #%d: the OPS found no shot for this sound; discarding it",
+                    capture.sequence,
+                )
+                self._reject_hold(capture.sequence)
+            if not matched:
+                self._rejected_edges.append(timestamp)
+            return bool(matched)
+
+    def _claim(self, capture: IWR6843Capture) -> IWR6843Capture:
+        """Hand a capture to a shot; caller holds _condition."""
+        hold = self._hold
+        if hold is not None and hold.sequence == capture.sequence:
+            hold.claimed = True
+        return capture
+
+    def _take_rejection(self, edge_timestamp: float) -> bool:
+        """Consume a pending OPS rejection of this edge; caller holds _condition."""
+        for rejected in self._rejected_edges:
+            if abs(rejected - edge_timestamp) <= self.match_tolerance_s:
+                self._rejected_edges.remove(rejected)
+                return True
+        return False
+
+    def _reject_hold(self, sequence: int) -> None:
+        """Wake the capture thread to release an unclaimed hold; caller holds _condition."""
+        hold = self._hold
+        if hold is not None and hold.sequence == sequence and not hold.claimed:
+            hold.rejected = True
+            hold.done.set()
+
     def capture_for_shot(
         self,
         impact_timestamp: float | None,
@@ -428,7 +499,7 @@ class IWR6843CaptureMonitor:
         with self._condition:
             while True:
                 if impact_timestamp is None and self._captures:
-                    return self._captures.popleft()
+                    return self._claim(self._captures.popleft())
 
                 if impact_timestamp is not None:
                     cutoff = impact_timestamp - self.match_tolerance_s
@@ -452,7 +523,7 @@ class IWR6843CaptureMonitor:
                             key=lambda capture: abs(capture.trigger_timestamp - impact_timestamp),
                         )
                         self._captures.remove(selected)
-                        return selected
+                        return self._claim(selected)
 
                     matching_capture_active = abs(
                         self._last_edge_timestamp - impact_timestamp

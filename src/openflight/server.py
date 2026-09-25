@@ -3935,15 +3935,10 @@ def start_monitor(
             live_callback=on_live_reading,
         )
     elif not mock:
-
-        def on_trigger_diagnostic(data: dict):
-            """Forward trigger diagnostics to connected UI clients."""
-            socketio.emit("trigger_diagnostic", data)
-
         monitor.start(  # pylint: disable=unexpected-keyword-arg
             shot_callback=on_shot_detected,
             live_callback=on_live_reading,
-            diagnostic_callback=on_trigger_diagnostic,
+            diagnostic_callback=_on_trigger_diagnostic,
             processing_callback=on_shot_processing,
             shot_preview_callback=on_shot_preview,
         )
@@ -3951,6 +3946,25 @@ def start_monitor(
             iwr6843_runtime.capture_monitor.arm()
     else:
         monitor.start(shot_callback=on_shot_detected, live_callback=on_live_reading)
+
+
+def _on_trigger_diagnostic(data: dict) -> None:
+    """Forward a trigger outcome to the UI; on a rejection, free the IWR ring.
+
+    The IWR6843 freezes its ring for every sound. When the OPS finds no shot
+    for one, the ring would otherwise stay frozen for the whole hold budget,
+    and a real swing in that window would lose its launch angle.
+    """
+    socketio.emit("trigger_diagnostic", data)
+    edge = data.get("trigger_timestamp")
+    if data.get("accepted") or edge is None or iwr6843_runtime is None:
+        return
+    try:
+        iwr6843_runtime.capture_monitor.discard_trigger(edge)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.warning(
+            "[SERVER] Freeing the IWR6843 capture for a rejected trigger failed", exc_info=True
+        )
 
 
 def _fire_cloud_push(session_logger):

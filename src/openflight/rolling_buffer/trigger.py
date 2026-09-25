@@ -61,8 +61,13 @@ class TriggerStrategy(ABC):
         peak_outbound_magnitude: float = 0.0,
         peak_inbound_magnitude: float = 0.0,
         trigger_latency_ms: Optional[float] = None,
+        trigger_timestamp: Optional[float] = None,
     ):
-        """Append a diagnostic entry for the current trigger event."""
+        """Append a diagnostic entry for the current trigger event.
+
+        ``trigger_timestamp`` is the sound's host-clock edge time; on a
+        rejection it lets the IWR6843 release the ring it froze for that sound.
+        """
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "accepted": accepted,
@@ -80,6 +85,8 @@ class TriggerStrategy(ABC):
         }
         if trigger_latency_ms is not None:
             entry["trigger_latency_ms"] = trigger_latency_ms
+        if trigger_timestamp is not None:
+            entry["trigger_timestamp"] = trigger_timestamp
         self._diagnostics.append(entry)
 
     def _summarize_capture_activity(
@@ -121,6 +128,7 @@ class TriggerStrategy(ABC):
         reason: str,
         response_bytes: int,
         trigger_latency_ms: Optional[float] = None,
+        trigger_timestamp: Optional[float] = None,
     ):
         """Append a diagnostic entry using capture-activity summary fields."""
         self._append_diagnostic(
@@ -137,6 +145,7 @@ class TriggerStrategy(ABC):
             peak_outbound_magnitude=summary["peak_outbound_magnitude"],
             peak_inbound_magnitude=summary["peak_inbound_magnitude"],
             trigger_latency_ms=trigger_latency_ms,
+            trigger_timestamp=trigger_timestamp,
         )
 
     @abstractmethod
@@ -788,6 +797,7 @@ class SoundTrigger(TriggerStrategy):
                 accepted=False,
                 reason="no_outbound_speed",
                 response_bytes=response_len,
+                trigger_timestamp=capture.trigger_timestamp,
             )
             return None
 

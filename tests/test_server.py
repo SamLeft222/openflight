@@ -5038,3 +5038,73 @@ class TestCameraAnalysisSwitch:
 
         assert registered == [str(tmp_path)]
         assert shot.camera_replay == {"id": "r1"}
+
+
+class TestTriggerDiagnosticFreesTheIwrRing:
+    """An OPS rejection releases the IWR6843 ring frozen for the same sound."""
+
+    @staticmethod
+    def _wire(monkeypatch, *, runtime=True):
+        emitted, discarded = [], []
+        monitor = SimpleNamespace(
+            discard_trigger=lambda ts: discarded.append(ts) or True,
+        )
+        monkeypatch.setattr(
+            server_module,
+            "iwr6843_runtime",
+            SimpleNamespace(capture_monitor=monitor) if runtime else None,
+        )
+        monkeypatch.setattr(
+            server_module.socketio, "emit", lambda event, data: emitted.append((event, data))
+        )
+        return emitted, discarded
+
+    def test_rejection_discards_the_matching_capture(self, monkeypatch):
+        emitted, discarded = self._wire(monkeypatch)
+        event = {"accepted": False, "reason": "no_outbound_speed", "trigger_timestamp": 12.5}
+
+        server_module._on_trigger_diagnostic(event)
+
+        assert discarded == [12.5]
+        assert emitted == [("trigger_diagnostic", event)]
+
+    def test_accepted_trigger_keeps_the_capture(self, monkeypatch):
+        emitted, discarded = self._wire(monkeypatch)
+
+        server_module._on_trigger_diagnostic(
+            {"accepted": True, "reason": "accepted", "trigger_timestamp": 12.5}
+        )
+
+        assert discarded == []
+        assert len(emitted) == 1
+
+    def test_rejection_without_edge_time_is_only_forwarded(self, monkeypatch):
+        emitted, discarded = self._wire(monkeypatch)
+
+        server_module._on_trigger_diagnostic({"accepted": False, "reason": "parse_failed"})
+
+        assert discarded == []
+        assert len(emitted) == 1
+
+    def test_without_iwr_the_diagnostic_is_only_forwarded(self, monkeypatch):
+        emitted, _discarded = self._wire(monkeypatch, runtime=False)
+
+        server_module._on_trigger_diagnostic(
+            {"accepted": False, "reason": "no_outbound_speed", "trigger_timestamp": 12.5}
+        )
+
+        assert len(emitted) == 1
+
+    def test_a_discard_error_never_breaks_the_ops_thread(self, monkeypatch):
+        emitted, _discarded = self._wire(monkeypatch)
+
+        def broken(_ts):
+            raise RuntimeError("boom")
+
+        server_module.iwr6843_runtime.capture_monitor.discard_trigger = broken
+
+        server_module._on_trigger_diagnostic(
+            {"accepted": False, "reason": "no_outbound_speed", "trigger_timestamp": 12.5}
+        )
+
+        assert len(emitted) == 1

@@ -498,6 +498,7 @@ class RollingBufferMonitor:
                             reason="processing_failed",
                             timestamp=capture.trigger_time,
                             latency_ms=trigger_latency_ms,
+                            trigger_timestamp=capture.trigger_timestamp,
                         )
                         trigger_event_recorded = True
                         continue
@@ -734,6 +735,7 @@ class RollingBufferMonitor:
                             reason="shot_validation_failed",
                             timestamp=datetime.now().isoformat(),
                             latency_ms=trigger_latency_ms,
+                            trigger_timestamp=capture.trigger_timestamp,
                             **self._timeline_diagnostic(processed.timeline),
                             ball_speed_mph=processed.ball_speed_mph,
                         )
@@ -758,6 +760,7 @@ class RollingBufferMonitor:
                         reason="processing_error",
                         timestamp=capture.trigger_time,
                         latency_ms=trigger_latency_ms,
+                        trigger_timestamp=capture.trigger_timestamp,
                     )
                 log_session_error(
                     "Rolling buffer capture loop error",

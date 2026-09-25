@@ -3221,3 +3221,135 @@ class TestSpinDriverDeadZone:
         assert result.spin_rpm == 0 or result.quality == "low", (
             f"Decay ramp faked spin: {result.spin_rpm} RPM quality={result.quality}"
         )
+
+
+class TestRejectedTriggerCarriesEdgeTime:
+    """Every "no shot" outcome names its sound's host-clock edge time.
+
+    The IWR6843 holds its frozen ring for each sound; the server uses this
+    time to release the ring as soon as the OPS finds no shot for it.
+    """
+
+    EDGE = 1790309197.25
+
+    def _capture(self):
+        capture = IQCapture(
+            sample_time=0.0, trigger_time=0.068, i_samples=[2048] * 16, q_samples=[2048] * 16
+        )
+        capture.first_byte_timestamp = self.EDGE + 0.07
+        capture.trigger_timestamp = self.EDGE
+        return capture
+
+    def test_no_outbound_speed_rejection(self):
+        from openflight.rolling_buffer.trigger import SoundTrigger
+
+        trigger = SoundTrigger()
+        capture = self._capture()
+
+        class QuietProcessor:
+            @staticmethod
+            def parse_capture(_response, first_byte_timestamp=None):
+                return capture
+
+            @staticmethod
+            def process_standard(_capture):
+                return SpeedTimeline(readings=[], sample_rate_hz=56.0)
+
+        assert (
+            trigger._handle_dump(QuietProcessor(), "dump", capture.first_byte_timestamp, {}) is None
+        )
+
+        (diag,) = trigger.drain_diagnostics()
+        assert diag["reason"] == "no_outbound_speed"
+        assert diag["trigger_timestamp"] == self.EDGE
+
+    def _run_monitor(self, processor, monkeypatch, create_shot=None):
+        from openflight.rolling_buffer import RollingBufferMonitor, monitor as monitor_module
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="sound")
+        capture = self._capture()
+
+        class OneCaptureTrigger:
+            calls = 0
+
+            def wait_for_trigger(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return capture
+                monitor._running = False
+                return None
+
+            @staticmethod
+            def finish_capture(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def drain_diagnostics():
+                return [{"accepted": True, "reason": "accepted", "response_bytes": 4096}]
+
+            @staticmethod
+            def reset():
+                return None
+
+        events = []
+        monkeypatch.setattr(monitor_module, "get_session_logger", lambda: None)
+        monkeypatch.setattr(monitor_module.time, "sleep", lambda _delay: None)
+        monitor.trigger = OneCaptureTrigger()
+        monitor.processor = processor
+        if create_shot is not None:
+            monitor._create_shot = create_shot
+        monitor._diagnostic_callback = events.append
+        monitor._running = True
+        monitor._capture_loop()
+        return events
+
+    def test_processing_failed_rejection(self, monkeypatch):
+        class FailingProcessor:
+            @staticmethod
+            def process_capture(*_args, **_kwargs):
+                return None
+
+        (event,) = self._run_monitor(FailingProcessor(), monkeypatch)
+        assert event["reason"] == "processing_failed"
+        assert event["trigger_timestamp"] == self.EDGE
+
+    def test_processing_error_rejection(self, monkeypatch):
+        class ExplodingProcessor:
+            @staticmethod
+            def process_capture(*_args, **_kwargs):
+                raise RuntimeError("FFT failed")
+
+        (event,) = self._run_monitor(ExplodingProcessor(), monkeypatch)
+        assert event["reason"] == "processing_error"
+        assert event["trigger_timestamp"] == self.EDGE
+
+    def test_shot_validation_failed_rejection(self, monkeypatch):
+        from types import SimpleNamespace
+
+        slow = SimpleNamespace(
+            ball_speed_mph=9.0,
+            club_speed_mph=None,
+            timeline=SpeedTimeline(readings=[], sample_rate_hz=56.0),
+        )
+
+        class SlowProcessor:
+            @staticmethod
+            def process_capture(*_args, **_kwargs):
+                return slow
+
+        (event,) = self._run_monitor(SlowProcessor(), monkeypatch, create_shot=lambda _p: None)
+        assert event["reason"] == "shot_validation_failed"
+        assert event["trigger_timestamp"] == self.EDGE
+
+    def test_accepted_shots_carry_no_rejection_time(self, monkeypatch):
+        """Only rejections free the IWR ring; an accepted shot's diagnostic is unchanged."""
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        monitor = RollingBufferMonitor(port=None, trigger_type="sound")
+        events = []
+        monitor._diagnostic_callback = events.append
+        monkeypatch.setattr("openflight.rolling_buffer.monitor.get_session_logger", lambda: None)
+
+        monitor._record_trigger_event({}, accepted=True, reason="accepted")
+
+        assert "trigger_timestamp" not in events[0]

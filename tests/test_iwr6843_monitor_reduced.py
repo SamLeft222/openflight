@@ -250,3 +250,135 @@ def test_firmware_without_reduced_transfer_falls_back_to_full_dumps(tmp_path):
     assert capture.transfer == "full" and capture.raw == CAPTURE
     assert radar.calls == ["config", "gate", "dump"]
     monitor.stop()
+
+
+# --- The OPS found no shot for a sound: free its capture at once -------------
+
+
+def _wait_for(predicate, timeout_s: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def _held(monitor, radar) -> float:
+    """Trigger an edge and wait until its overview holds the ring."""
+    edge = time.time()
+    assert monitor.notify_trigger(edge)
+    assert _wait_for(lambda: radar.held)
+    return edge
+
+
+def test_ops_rejection_releases_a_held_capture_well_before_the_budget(tmp_path):
+    radar = FakeReducedRadar()
+    monitor = _monitor(tmp_path, radar, hold_budget_s=30.0)
+    edge = _held(monitor, radar)
+
+    assert monitor.discard_trigger(edge + 0.07)  # OPS first-byte estimate, ~70 ms late
+
+    assert _wait_for(lambda: not radar.held)
+    assert radar.calls[-1] == "release"
+    assert monitor.capture_for_shot(edge, timeout_s=0.2) is None
+    assert _wait_for(lambda: monitor.notify_trigger(time.time()))  # radar free again
+    monitor.stop()
+
+
+def test_ops_rejection_before_the_overview_lands_releases_it_on_arrival(tmp_path):
+    arrived = threading.Event()
+    proceed = threading.Event()
+
+    class SlowOverview(FakeReducedRadar):
+        def read_overview(self):
+            arrived.set()
+            proceed.wait(2.0)
+            return super().read_overview()
+
+    radar = SlowOverview()
+    monitor = _monitor(tmp_path, radar, hold_budget_s=30.0)
+    edge = time.time()
+    assert monitor.notify_trigger(edge)
+    assert arrived.wait(2.0)
+
+    monitor.discard_trigger(edge)
+    proceed.set()
+
+    assert _wait_for(lambda: "release" in radar.calls and not radar.held)
+    assert monitor.capture_for_shot(edge, timeout_s=0.2) is None
+    monitor.stop()
+
+
+def test_rejection_of_a_different_sound_leaves_the_capture_alone(tmp_path):
+    radar = FakeReducedRadar()
+    monitor = _monitor(tmp_path, radar, hold_budget_s=30.0)
+    edge = _held(monitor, radar)
+
+    assert not monitor.discard_trigger(edge - 5.0)
+
+    time.sleep(0.1)
+    assert radar.held
+    capture = monitor.capture_for_shot(edge, timeout_s=0.5)
+    assert capture is not None
+    monitor.finish_capture(capture, full_dump=False)
+    monitor.stop()
+
+
+def test_a_capture_claimed_for_a_shot_is_never_released_by_a_rejection(tmp_path):
+    radar = FakeReducedRadar()
+    monitor = _monitor(tmp_path, radar, hold_budget_s=30.0)
+    edge = _held(monitor, radar)
+    capture = monitor.capture_for_shot(edge, timeout_s=0.5)
+
+    assert not monitor.discard_trigger(edge)
+
+    time.sleep(0.1)
+    assert radar.held
+    assert monitor.read_strips(capture, REQUEST) == reduced.serve_strips(CAPTURE, REQUEST)
+    monitor.finish_capture(capture, full_dump=False)
+    monitor.stop()
+
+
+def test_a_stale_rejection_does_not_match_a_later_edge(tmp_path):
+    radar = FakeReducedRadar()
+    monitor = _monitor(tmp_path, radar, hold_budget_s=30.0)
+    monitor.discard_trigger(time.time() - 10.0)  # a sound the IWR never saw
+
+    capture = _capture(monitor)
+
+    assert radar.held
+    monitor.finish_capture(capture, full_dump=False)
+    monitor.stop()
+
+
+def test_full_transfer_rejection_drops_the_queued_capture(tmp_path):
+    radar = FakeReducedRadar()
+    config = tmp_path / "radar.cfg"
+    config.write_text("sensorStart\n", encoding="utf-8")
+    monitor = IWR6843CaptureMonitor(
+        config_path=config, output_dir=tmp_path / "dumps", radar=radar, button_factory=FakeButton
+    )
+    monitor.start()
+    edge = time.time()
+    assert monitor.notify_trigger(edge)
+    assert _wait_for(lambda: "dump" in radar.calls)
+    time.sleep(0.05)
+
+    assert monitor.discard_trigger(edge)
+
+    assert monitor.capture_for_shot(edge, timeout_s=0.2) is None
+    assert radar.calls == ["config", "dump"]
+    monitor.stop()
+
+
+def test_discard_without_a_timestamp_is_ignored(tmp_path):
+    radar = FakeReducedRadar()
+    monitor = _monitor(tmp_path, radar, hold_budget_s=30.0)
+    edge = _held(monitor, radar)
+
+    assert not monitor.discard_trigger(None)
+
+    assert radar.held
+    monitor.finish_capture(monitor.capture_for_shot(edge, timeout_s=0.5), full_dump=False)
+    monitor.stop()
