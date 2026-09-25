@@ -328,12 +328,17 @@ def _candidate_trajectory(
 
 def _spatial_dictionary(
     model: str,
-    launch_rad: float,
+    launch_rad: float | np.ndarray,
     range_m: np.ndarray,
     geometry: dict,
     tdm_tau_s: float,
 ) -> np.ndarray:
-    """Build the exact frozen DD/DG/GD/GG moving-ball dictionary."""
+    """Build the exact frozen DD/DG/GD/GG moving-ball dictionary.
+
+    ``launch_rad`` may be a column of candidates, shape ``(G, 1)``; the result
+    then gains a leading candidate axis. Every operation is element-wise, so
+    each candidate's dictionary equals the one built for it alone.
+    """
     tx_order = doa.validate_tx_order(geometry["tx_order"])
     x_m, height_m, direct_vr, image_vr = _candidate_trajectory(launch_rad, range_m, geometry)
     tilt_rad = geometry["tilt_rad"]
@@ -343,8 +348,8 @@ def _spatial_dictionary(
 
     tx = np.repeat(np.array([0.0, 4.0]), 4)[None, :]
     rx = np.tile(np.arange(4, dtype=float), 2)[None, :]
-    sin_direct = np.sin(direct)[:, None]
-    sin_image = np.sin(image)[:, None]
+    sin_direct = np.sin(direct)[..., None]
+    sin_image = np.sin(image)[..., None]
     dd = np.exp(1j * np.pi * (tx * sin_direct + rx * sin_direct))
     dg = np.exp(1j * np.pi * (tx * sin_direct + rx * sin_image))
     gd = np.exp(1j * np.pi * (tx * sin_image + rx * sin_direct))
@@ -354,9 +359,9 @@ def _spatial_dictionary(
         cross_phase = 2.0 * np.pi * (image_vr - direct_vr) * tdm_tau_s / LAM
         later = doa.later_physical_tx_index(tx_order)
         block = slice(4 * later, 4 * (later + 1))
-        dg[:, block] *= np.exp(1j * cross_phase)[:, None]
-        gd[:, block] *= np.exp(1j * cross_phase)[:, None]
-        gg[:, block] *= np.exp(2j * cross_phase)[:, None]
+        dg[..., block] *= np.exp(1j * cross_phase)[..., None]
+        gd[..., block] *= np.exp(1j * cross_phase)[..., None]
+        gg[..., block] *= np.exp(2j * cross_phase)[..., None]
 
     if model == "two8":
         return np.stack([dd, gg], axis=-1)
@@ -370,6 +375,18 @@ def _frame_objective(errors: np.ndarray, frames: np.ndarray, ceiling: float) -> 
         np.median(np.clip(errors[frames == frame], 1e-8, ceiling)) for frame in np.unique(frames)
     ]
     return float(np.mean(np.log(frame_errors)))
+
+
+def _frame_objectives(errors: np.ndarray, frames: np.ndarray, ceiling: float) -> np.ndarray:
+    """``_frame_objective`` for each row of ``errors`` (candidates x snapshots)."""
+    frame_errors = np.stack(
+        [
+            np.median(np.clip(errors[:, frames == frame], 1e-8, ceiling), axis=1)
+            for frame in np.unique(frames)
+        ],
+        axis=1,
+    )
+    return np.mean(np.log(frame_errors), axis=1)
 
 
 def _refine_grid(grid_deg: np.ndarray, objective: np.ndarray) -> float:
@@ -474,15 +491,14 @@ def _channel_estimates(
     range_m = cache["r"][indices]
     estimates: dict[str, float] = {}
     evidence: dict[str, float | None] = {}
+    # The whole grid at once: one (grid, snapshot, channel, path) dictionary.
+    launch_rad = np.radians(np.asarray(grid_deg, dtype=float))[:, None]
     for model in CHANNEL_MODELS:
-        objective = []
-        for angle_deg in grid_deg:
-            dictionary = _spatial_dictionary(
-                model, np.radians(angle_deg), range_m, geometry, geometry["tdm_tau_s"]
-            )
-            errors = leave_one_channel_out_error(vectors, dictionary)
-            objective.append(_frame_objective(errors, frames, 1e3))
-        objective = np.asarray(objective)
+        dictionary = _spatial_dictionary(
+            model, launch_rad, range_m, geometry, geometry["tdm_tau_s"]
+        )
+        errors = leave_one_channel_out_error(vectors, dictionary)
+        objective = _frame_objectives(errors, frames, 1e3)
         estimates[f"channel_{model}_deg"] = _refine_grid(grid_deg, objective)
         evidence[f"channel_{model}_deg"] = grid_curvature(objective)
     return estimates, evidence

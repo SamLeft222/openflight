@@ -143,12 +143,17 @@ def _candidate_tracks_for_scope(  # pylint: disable=too-many-arguments
         ]
     )
     resolution_m = geometry.range_res_m
-    candidates: dict[tuple[int, int], RecoveryCandidate] = {}
+    # Best candidate per (speed, impact) cell: quality, track fields, impact.
+    best: dict[tuple[int, int], tuple] = {}
     if calibration.tee_range_m is None:
         raise ValueError("recovery requires measured tee range")
     apparent_tee_m = calibration.tee_range_m + calibration.range_bias_m
     min_slope = 20.0 / resolution_m
     max_slope = 90.0 / resolution_m
+    # Many point pairs on one walk select the same inliers, and the same
+    # inliers always give the same candidate, which can never displace an
+    # incumbent of equal quality -- so each inlier set is fitted once.
+    fitted_inlier_sets: set[bytes] = set()
     for first in range(times.size - 1):
         later_times = times[first + 1 :]
         delta_times = times[first] - later_times
@@ -160,13 +165,26 @@ def _candidate_tracks_for_scope(  # pylint: disable=too-many-arguments
             where=valid_time,
         )
         valid_seconds = np.flatnonzero(valid_time & (slopes >= min_slope) & (slopes <= max_slope))
-        for second_offset in valid_seconds:
-            slope = float(slopes[second_offset])
-            intercept = bins[first] - slope * times[first]
-            inliers = np.abs(bins - (slope * times + intercept)) < 0.8
-            count = int(inliers.sum())
+        if valid_seconds.size == 0:
+            continue
+        # Every pair anchored on this point at once; the same element-wise
+        # arithmetic as one pair at a time, so the inliers are identical.
+        pair_slopes = slopes[valid_seconds]
+        pair_intercepts = bins[first] - pair_slopes * times[first]
+        pair_inliers = (
+            np.abs(
+                bins[None, :] - (pair_slopes[:, None] * times[None, :] + pair_intercepts[:, None])
+            )
+            < 0.8
+        )
+        for inliers, count in zip(pair_inliers, pair_inliers.sum(axis=1)):
             if count < 10:
                 continue
+            inlier_set = np.packbits(inliers).tobytes()
+            if inlier_set in fitted_inlier_sets:
+                continue
+            fitted_inlier_sets.add(inlier_set)
+            count = int(count)
             inlier_times = times[inliers]
             inlier_bins = bins[inliers]
             fit = _fit_line(inlier_times, inlier_bins)
@@ -176,40 +194,45 @@ def _candidate_tracks_for_scope(  # pylint: disable=too-many-arguments
             speed_ms = float(fitted_slope * resolution_m)
             if not 20.0 <= speed_ms <= 90.0:
                 continue
+            impact_s = (apparent_tee_m / resolution_m - fitted_intercept) / fitted_slope
+            if not 0.0 <= impact_s <= geometry.capture_duration_s:
+                continue
             residuals = inlier_bins - (fitted_slope * inlier_times + fitted_intercept)
             rms = float(np.sqrt(np.mean(residuals**2)))
             first_time = float(inlier_times.min())
             last_time = float(inlier_times.max())
-            track = BallTrack(
-                speed_ms=speed_ms,
-                slope_bins=float(fitted_slope),
-                intercept_bins=float(fitted_intercept),
-                rms_bins=rms,
-                n_inliers=count,
-                t_first=first_time,
-                t_last=last_time,
-                low_confidence=rms >= 0.45 or last_time - first_time < 0.012,
-            )
-            impact_s = (apparent_tee_m / resolution_m - fitted_intercept) / fitted_slope
-            if not 0.0 <= impact_s <= geometry.capture_duration_s:
+            key = (round(speed_ms / 0.6), round(impact_s / 0.0008))
+            quality = (count, -rms, last_time - first_time)
+            incumbent = best.get(key)
+            if incumbent is not None and not quality > incumbent[0]:
                 continue
-            candidate = RecoveryCandidate(
+            best[key] = (
+                quality,
+                (speed_ms, fitted_slope, fitted_intercept, rms, count, first_time, last_time),
+                impact_s,
+            )
+    candidates = []
+    for _quality, fields, impact_s in best.values():
+        speed_ms, slope, intercept, rms, count, first_time, last_time = fields
+        track = BallTrack(
+            speed_ms=speed_ms,
+            slope_bins=float(slope),
+            intercept_bins=float(intercept),
+            rms_bins=rms,
+            n_inliers=count,
+            t_first=first_time,
+            t_last=last_time,
+            low_confidence=rms >= 0.45 or last_time - first_time < 0.012,
+        )
+        candidates.append(
+            RecoveryCandidate(
                 track=track,
                 scope=scope,
                 impact_s=float(impact_s),
                 speed_ratio=track.speed_mph / ball_speed_mph,
             )
-            key = (round(speed_ms / 0.6), round(impact_s / 0.0008))
-            incumbent = candidates.get(key)
-            quality = (count, -rms, last_time - first_time)
-            if incumbent is None:
-                candidates[key] = candidate
-                continue
-            old = incumbent.track
-            old_quality = (old.n_inliers, -old.rms_bins, old.t_last - old.t_first)
-            if quality > old_quality:
-                candidates[key] = candidate
-    return list(candidates.values())
+        )
+    return candidates
 
 
 def find_recovery_candidates(
