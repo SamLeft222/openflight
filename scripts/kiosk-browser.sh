@@ -13,10 +13,38 @@
 # Expects from the caller: PROJECT_DIR, log(), warn().
 # Sets: BROWSER_PID, BROWSER_PGID, BROWSER_LAUNCHED.
 
+# openflight.service can start before the desktop's display server at boot.
+# Chromium then exits at once ("Missing X server or $DISPLAY") and the kiosk
+# never appears. Both browsers use DISPLAY=:0 (Xwayland under Wayland), whose
+# socket appears when the display is up, so wait for it before launching.
+KIOSK_X_SOCKET="${KIOSK_X_SOCKET:-/tmp/.X11-unix/X0}"
+KIOSK_DISPLAY_WAIT_S="${KIOSK_DISPLAY_WAIT_S:-120}"
+# A socket that just appeared may not accept clients yet.
+KIOSK_DISPLAY_SETTLE_S="${KIOSK_DISPLAY_SETTLE_S:-2}"
+
+wait_for_kiosk_display() {
+    local waited=0
+    if [ -S "$KIOSK_X_SOCKET" ]; then
+        return 0
+    fi
+    log "Waiting for the desktop display ($KIOSK_X_SOCKET)..."
+    while [ ! -S "$KIOSK_X_SOCKET" ]; do
+        if [ "$waited" -ge "$KIOSK_DISPLAY_WAIT_S" ]; then
+            warn "Desktop display not ready after ${KIOSK_DISPLAY_WAIT_S}s; launching the browser anyway"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    sleep "$KIOSK_DISPLAY_SETTLE_S"
+    log "Desktop display ready after ${waited}s"
+}
+
 launch_kiosk_browser() {
     local url="$1"
     local electron_bin="$PROJECT_DIR/ui/node_modules/.bin/electron"
 
+    wait_for_kiosk_display || true
     log "Launching kiosk shell (Electron)..."
     if [ -x "$electron_bin" ]; then
         _launch_kiosk_process env DISPLAY=:0 OPENFLIGHT_URL="$url" "$electron_bin" "$PROJECT_DIR/ui"

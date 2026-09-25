@@ -5,8 +5,11 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -246,7 +249,9 @@ def test_kiosk_shell_scripts_use_unix_newlines():
         "scripts/require-node.sh",
     ):
         data = (REPO_ROOT / relative).read_bytes()
-        assert b"\r" not in data, f"{relative} must use LF newlines so sourced path checks match on the Pi"
+        assert b"\r" not in data, (
+            f"{relative} must use LF newlines so sourced path checks match on the Pi"
+        )
 
 
 def test_ui_is_ensured_before_the_kiosk_browser_launches():
@@ -346,7 +351,12 @@ def _run_ensure_kiosk_ui(
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
     for name in ("ensure-kiosk-ui.sh", "require-node.sh"):
-        text = (repo_scripts / name).read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        text = (
+            (repo_scripts / name)
+            .read_text(encoding="utf-8")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
         (scripts_dir / name).write_bytes(text.encode("utf-8"))
     project_dir = tmp_path / "project"
     ui_dir = project_dir / "ui"
@@ -727,3 +737,83 @@ def test_startup_failure_prints_the_recovery_hint_to_the_terminal():
     ]
 
     assert re.search(r'error ".*\$recovery"', failure_fn), failure_fn
+
+
+# -- waiting for the desktop display ---------------------------------------------
+#
+# Field report (2026-09-24): after a reboot openflight.service launched Chromium
+# 8 s after starting, before the desktop's display server existed. Chromium
+# logged "Missing X server or $DISPLAY" and exited; the server ran headless
+# with no kiosk window until a manual restart.
+
+
+def _run_display_wait(socket_path: Path, *, create_after_s: float | None, wait_s: int):
+    creator = None
+    if create_after_s is not None:
+        creator = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import socket, sys, time; time.sleep(float(sys.argv[2])); "
+                "s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); time.sleep(10)",
+                str(socket_path),
+                str(create_after_s),
+            ]
+        )
+    script = (
+        'log() { echo "LOG $*"; }; warn() { echo "WARN $*"; }; '
+        f"source {shlex.quote(_bash_path(REPO_ROOT / 'scripts/kiosk-browser.sh'))}; "
+        f"KIOSK_X_SOCKET={shlex.quote(str(socket_path))}; "
+        f"KIOSK_DISPLAY_WAIT_S={wait_s}; KIOSK_DISPLAY_SETTLE_S=0; "
+        'wait_for_kiosk_display; echo "rc=$?"'
+    )
+    try:
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+    finally:
+        if creator is not None:
+            creator.kill()
+
+
+@pytest.fixture(name="socket_path")
+def _socket_path():
+    """UNIX socket paths are limited to ~104 bytes, too short for pytest's tmp_path."""
+    directory = Path(tempfile.mkdtemp(prefix="ofx", dir="/tmp"))
+    yield directory / "X0"
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs UNIX sockets")
+def test_display_wait_returns_at_once_when_the_desktop_is_up(socket_path):
+    display = socket.socket(socket.AF_UNIX)
+    display.bind(str(socket_path))
+    try:
+        result = _run_display_wait(socket_path, create_after_s=None, wait_s=5)
+    finally:
+        display.close()
+
+    assert "Waiting" not in result.stdout
+    assert "rc=0" in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs UNIX sockets")
+def test_display_wait_holds_the_browser_until_the_display_appears(socket_path):
+    result = _run_display_wait(socket_path, create_after_s=1.5, wait_s=10)
+
+    assert "Waiting for the desktop display" in result.stdout
+    assert "Desktop display ready" in result.stdout
+    assert "rc=0" in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs UNIX sockets")
+def test_display_wait_gives_up_and_launches_anyway(socket_path):
+    result = _run_display_wait(socket_path, create_after_s=None, wait_s=1)
+
+    assert "WARN Desktop display not ready after 1s" in result.stdout
+    assert "rc=1" in result.stdout
+
+
+def test_launcher_waits_for_the_display_before_any_browser():
+    launcher = _launcher_function()
+
+    wait_idx = launcher.index("wait_for_kiosk_display")
+    assert wait_idx < launcher.index('if [ -x "$electron_bin" ]; then')
