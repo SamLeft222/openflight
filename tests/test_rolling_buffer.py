@@ -624,6 +624,39 @@ class TestHardwareTriggeredCapture:
         radar.rearm_internal_speed_trigger.assert_called_once_with(30)
         assert trigger.drain_diagnostics()[0]["reason"] == "no_ball_speed"
 
+    def test_false_trigger_reports_its_edge_time(self):
+        """The IWR6843 detected the same swing; the edge time lets it be released."""
+        radar = MagicMock()
+        radar.wait_for_hardware_trigger.return_value = '{"Q": [1]}'
+        processor = MagicMock()
+        capture = self._capture()
+        capture.trigger_timestamp = 1790309197.25
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline([], 937.5)
+
+        trigger = HardwareTriggeredCapture()
+        trigger.wait_for_trigger(radar, processor, timeout=1.0)
+
+        assert trigger.drain_diagnostics()[0]["trigger_timestamp"] == 1790309197.25
+
+    def test_false_trigger_edge_time_falls_back_to_the_first_byte(self):
+        radar = MagicMock()
+        radar.wait_for_hardware_trigger.return_value = '{"Q": [1]}'
+        processor = MagicMock()
+        capture = IQCapture(
+            sample_time=0.0, trigger_time=0.1, i_samples=[2048] * 4096, q_samples=[2048] * 4096
+        )
+        capture.first_byte_timestamp = 1790309197.40
+        processor.parse_capture.return_value = capture
+        processor.process_standard.return_value = SpeedTimeline([], 937.5)
+
+        trigger = HardwareTriggeredCapture()
+        trigger.wait_for_trigger(radar, processor, timeout=1.0)
+
+        expected = capture.infer_trigger_timestamp_from_first_byte()
+        assert expected is not None
+        assert trigger.drain_diagnostics()[0]["trigger_timestamp"] == expected
+
     def test_rearms_after_malformed_dump(self):
         """Malformed board output cannot leave the internal trigger idle."""
         radar = MagicMock()

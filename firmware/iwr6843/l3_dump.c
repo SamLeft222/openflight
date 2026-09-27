@@ -63,6 +63,17 @@
 #include "reduced_overview.h"
 #endif
 
+/* Auto trigger (autotrigger.py / auto_trigger.h): the radar detects the
+ * club's approach itself, freezes after the post-impact frames, holds the
+ * ring like l3overview, and tells the Pi with an ILTRG1 line. It needs the
+ * IQ16 scratch frame of the IQ8 ring and the reduced-transfer hold. Off
+ * until the Pi sends autoTrigCfg. */
+#if defined(L3_REDUCED_TRANSFER) && defined(L3_RING_IQ8)
+#define L3_AUTO_TRIGGER 1
+#include <ti/sysbios/knl/Task.h>
+#include "auto_trigger.h"
+#endif
+
 /* --- task priorities (mirror the mmw demo): ctrl > CLI. -------------------- */
 #define L3_INIT_TASK_PRIORITY  2
 #define L3_CLI_TASK_PRIORITY   3
@@ -364,6 +375,33 @@ static uint32_t                gReducedOverviewMs;
 static uint32_t                gReducedPrepareMs;
 #endif
 
+#ifdef L3_AUTO_TRIGGER
+#define L3_AUTO_NOTICE_MAGIC "ILTRG1"
+#define L3_AUTO_TASK_PRIORITY (L3_CLI_TASK_PRIORITY - 2)
+/* Owned by the HWA re-arm task (it runs the detector each pre frame). */
+static at_config_t             gAutoCfg;
+static at_state_t              gAutoState;
+static uint8_t                 gAutoEnabled;
+/* Handed to the re-arm task under Hwi_disable, applied at its next frame. */
+static at_config_t             gAutoCfgNext;
+static volatile uint8_t        gAutoEnableNext;
+static volatile uint8_t        gAutoCfgUpdate;
+static volatile uint8_t        gAutoResetRequested;
+/* Detector freeze in flight -> frozen (not yet held) -> held (no overview yet). */
+static volatile uint8_t        gAutoFreezePending;
+static volatile uint8_t        gAutoFrozen;
+static uint8_t                 gAutoHeld;
+static uint32_t                gAutoFireTick;
+static uint8_t                 gAutoFireEnd;
+static uint8_t                 gAutoFireSlopeQ;
+static Semaphore_Handle        gAutoFrozenSemaphore;
+static uint32_t                gAutoSeq;
+static uint32_t                gAutoFires;
+static uint32_t                gAutoHolds;
+static uint32_t                gAutoAdopted;
+static uint32_t                gAutoErrors;
+#endif
+
 /* --- SDK handles ----------------------------------------------------------- */
 static SOC_Handle    gSocHandle;
 static UART_Handle   gCliUart;    /* MSS UARTA, instance 0, 115200, has RX */
@@ -473,6 +511,9 @@ static int32_t l3_cli_stats(int32_t argc, char *argv[]);
 #ifdef L3_REDUCED_TRANSFER
 static uint8_t l3_claimReducedHold(void);
 static void l3_dropReducedHold(void);
+#ifdef L3_AUTO_TRIGGER
+static int32_t l3_autoTakeHold(void);
+#endif
 static void l3_registerReducedCommands(CLI_Cfg *cliCfg);
 static int32_t l3_startReducedWatch(void);
 #endif
@@ -1923,6 +1964,16 @@ static int32_t l3_freezeHwaAfterPostFrames(void)
         /* Discard a stale completion before issuing a new request. */
     }
     key = Hwi_disable();
+#ifdef L3_AUTO_TRIGGER
+    if (gAutoFreezePending) {
+        /* The detector's post-impact frames are already being recorded:
+         * take its freeze over rather than restarting them. */
+        gAutoFreezePending = 0U;
+        gAutoAdopted++;
+        Hwi_restore(key);
+        return Semaphore_pend(gHwaFreezeSemaphore, 250U) ? 0 : -1;
+    }
+#endif
     gHwaFreezeRequested = 1U;
     gHwaFreezeRequestFrame = gRingFrame;
 #ifdef CONFIGURABLE_CAPTURE
@@ -1963,6 +2014,9 @@ static int32_t l3_freezeHwaForShutdown(void)
     key = Hwi_disable();
     gHwaFreezeRequested = 0U;
     gHwaShutdownRequested = 1U;
+#ifdef L3_AUTO_TRIGGER
+    gAutoFreezePending = 0U;
+#endif
     Hwi_restore(key);
 
     /* Handle a frame that completed just before the shutdown request. */
@@ -2042,6 +2096,9 @@ static int32_t l3_armHwaChain(void)
     if (!gHwaOpened || gHwaHandle == NULL) {
         return -1;
     }
+#ifdef L3_AUTO_TRIGGER
+    gAutoResetRequested = 1U;
+#endif
     (void)EDMA_disableChannel(gEdmaHandle, L3_HWA_OUT_PING_CHANNEL,
                               EDMA3_CHANNEL_TYPE_DMA);
     (void)EDMA_disableChannel(gEdmaHandle, L3_HWA_OUT_PONG_CHANNEL,
@@ -2109,6 +2166,59 @@ static int32_t l3_armHwaChain(void)
     }
     return l3_hwaStartRing();
 }
+
+#ifdef L3_AUTO_TRIGGER
+/* Run the detector on one completed pre-impact frame (re-arm task only). On
+ * a detection, request the same post-frame freeze l3dump uses. */
+static void l3_autoTriggerFrame(uint32_t slot, uint8_t scratch)
+{
+    uintptr_t key;
+    int32_t result;
+
+    key = Hwi_disable();
+    if (gAutoCfgUpdate) {
+        gAutoCfg = gAutoCfgNext;
+        gAutoEnabled = gAutoEnableNext;
+        gAutoCfgUpdate = 0U;
+        gAutoResetRequested = 1U;
+    }
+    Hwi_restore(key);
+    if (gAutoResetRequested) {
+        gAutoResetRequested = 0U;
+        at_reset(&gAutoState);
+    }
+    if (!gAutoEnabled || gHwaFreezeRequested || slot >= gCapturePlan.preFrames) {
+        return;
+    }
+    result = at_push_frame(&gAutoState, &gAutoCfg, &g_iq16FrameScratch[scratch][0],
+                           gCapturePlan.chirpsPerFrame, N_TX, N_RX,
+                           gCapturePlan.preStart, gCapturePlan.preBins);
+    if (result < 0) {
+        gAutoErrors++;
+        return;
+    }
+    if (result == 0) {
+        return;
+    }
+    key = Hwi_disable();
+    if (gCaptureActive && !gHwaFreezeRequested) {
+        gHwaFreezeRequested = 1U;
+        gHwaFreezeRequestFrame = gRingFrame;
+        gPostCaptureStarted = 0U;
+        gPostFramesCaptured = 0U;
+        gPostFramesObserved = 0U;
+        gActiveFrameShouldKeep = 1U;
+        gHwaFreezeTargetFrame = 0U;
+        gHwaFreezeRequests++;
+        gAutoFreezePending = 1U;
+        gAutoFireTick = Clock_getTicks();
+        gAutoFireEnd = gAutoState.det_end;
+        gAutoFireSlopeQ = gAutoState.det_slope_q;
+        gAutoFires++;
+    }
+    Hwi_restore(key);
+}
+#endif
 
 static void l3_hwaRearmTask(UArg arg0, UArg arg1)
 {
@@ -2205,6 +2315,17 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1)
                 }
 #endif
 #endif
+#ifdef L3_AUTO_TRIGGER
+                if (gAutoFreezePending) {
+                    /* The detector's freeze: hand the frozen ring to the
+                     * auto-trigger task, not to a waiting command. */
+                    key = Hwi_disable();
+                    gAutoFreezePending = 0U;
+                    gAutoFrozen = 1U;
+                    Hwi_restore(key);
+                    Semaphore_post(gAutoFrozenSemaphore);
+                } else
+#endif
                 if (gHwaFreezeSemaphore != NULL) {
                     Semaphore_post(gHwaFreezeSemaphore);
                 }
@@ -2231,6 +2352,10 @@ static void l3_hwaRearmTask(UArg arg0, UArg arg1)
                 (void)l3_startIq8EdmaPack(pendingSlot, pendingScratch);
 #else
                 l3_packIq8CompletedFrame(pendingSlot, pendingScratch);
+#endif
+#ifdef L3_AUTO_TRIGGER
+                /* The scratch stays intact until the frame after next. */
+                l3_autoTriggerFrame(pendingSlot, pendingScratch);
 #endif
             }
 #endif
@@ -2526,6 +2651,9 @@ static void l3_dumpFramePlan(uint32_t *actualPre, uint32_t *actualPost,
 /* Restart the ring from slot zero after a transfer of a frozen capture. */
 static int32_t l3_resumeCapture(void)
 {
+#ifdef L3_AUTO_TRIGGER
+    gAutoResetRequested = 1U;  /* the ring restarts: frames are not consecutive */
+#endif
 #ifdef HWA_CHAINED_SNAPSHOT_RING
     gRingFrame = 0U;
     gHwaFreezeRequestFrame = 0U;
@@ -2847,6 +2975,11 @@ static int32_t l3_cli_stats(int32_t argc, char *argv[])
               (unsigned)gReducedStrips,
               (unsigned)gReducedReleases, (unsigned)gReducedTimeouts,
               (unsigned)gReducedErrors);
+#endif
+#ifdef L3_AUTO_TRIGGER
+    CLI_write("auto: enabled=%u fires=%u holds=%u adopted=%u errors=%u notices=%u\n",
+              (unsigned)gAutoEnabled, (unsigned)gAutoFires, (unsigned)gAutoHolds,
+              (unsigned)gAutoAdopted, (unsigned)gAutoErrors, (unsigned)gAutoSeq);
 #endif
     return 0;
 }
@@ -3426,6 +3559,10 @@ static uint8_t l3_claimReducedHold(void)
     uint8_t held;
 
     l3_reducedLock();
+#ifdef L3_AUTO_TRIGGER
+    (void)l3_autoTakeHold();
+    gAutoHeld = 0U;
+#endif
     held = gReducedHeld;
     gReducedHeld = 0U;
     l3_reducedUnlock();
@@ -3436,6 +3573,10 @@ static uint8_t l3_claimReducedHold(void)
 static void l3_dropReducedHold(void)
 {
     l3_reducedLock();
+#ifdef L3_AUTO_TRIGGER
+    (void)l3_autoTakeHold();
+    gAutoHeld = 0U;
+#endif
     gReducedHeld = 0U;
     l3_reducedUnlock();
 }
@@ -3528,16 +3669,29 @@ static int32_t l3_cli_overview(int32_t argc, char *argv[])
         CLI_write("Error: send overviewCfg before l3overview\n");
         return -1;
     }
+#ifdef L3_AUTO_TRIGGER
+    (void)l3_autoTakeHold();
+    if (gReducedHeld && gAutoHeld) {
+        /* The detector froze and described this ring: send its overview. */
+        gAutoHeld = 0U;
+        if (ro_check_overview(&gHeldCapture, gOverviewGateLo, gOverviewGateHi) != RO_OK) {
+            gReducedErrors++;
+            gReducedHeld = 0U;
+            (void)l3_resumeCapture();
+            l3_reducedUnlock();
+            CLI_write("Error: frozen capture cannot be described\n");
+            return -1;
+        }
+    } else
+#endif
     if (gReducedHeld) {
         l3_reducedUnlock();
         CLI_write("Error: a capture is already held; send l3release\n");
         return -1;
-    }
-    if (!gCaptureActive || l3_stopCaptureAtBoundary() != 0) {
+    } else if (!gCaptureActive || l3_stopCaptureAtBoundary() != 0) {
         l3_reducedUnlock();
         return -1;
-    }
-    if (l3_describeHeldCapture() != 0 ||
+    } else if (l3_describeHeldCapture() != 0 ||
         ro_check_overview(&gHeldCapture, gOverviewGateLo, gOverviewGateHi) != RO_OK) {
         gReducedErrors++;
         (void)l3_resumeCapture();
@@ -3552,6 +3706,7 @@ static int32_t l3_cli_overview(int32_t argc, char *argv[])
     gReducedPrepareMs = l3_elapsedMs(startTick);
     if (status != RO_OK) {
         gReducedErrors++;
+        gReducedHeld = 0U;  /* a detector hold is already marked held */
         (void)l3_resumeCapture();
         l3_reducedUnlock();
         CLI_write("Error: overview failed (%d)\n", (int)status);
@@ -3610,6 +3765,10 @@ static int32_t l3_cli_release(int32_t argc, char *argv[])
     (void)argc; (void)argv;
 
     l3_reducedLock();
+#ifdef L3_AUTO_TRIGGER
+    (void)l3_autoTakeHold();
+    gAutoHeld = 0U;
+#endif
     if (gReducedHeld) {
         gReducedHeld = 0U;
         gReducedReleases++;
@@ -3618,6 +3777,155 @@ static int32_t l3_cli_release(int32_t argc, char *argv[])
     l3_reducedUnlock();
     return status;
 }
+
+#ifdef L3_AUTO_TRIGGER
+/* Turn a detector-frozen ring into a held capture (caller holds the reduced
+ * lock). 1 when it did, 0 when there was none, -1 on failure (capture
+ * resumed). Every command that touches the hold calls this first, so the
+ * order of the auto-trigger task and a command never matters. */
+static int32_t l3_autoTakeHold(void)
+{
+    if (!gAutoFrozen) {
+        return 0;
+    }
+    gAutoFrozen = 0U;
+    if (l3_finishCaptureStop() != 0 || l3_describeHeldCapture() != 0) {
+        gAutoErrors++;
+        (void)l3_resumeCapture();
+        return -1;
+    }
+    gReducedHeld = 1U;
+    gAutoHeld = 1U;
+    gReducedHoldTick = Clock_getTicks();
+    gAutoHolds++;
+    return 1;
+}
+
+static uint32_t l3_formatUnsigned(char *out, uint32_t value)
+{
+    char digits[10];
+    uint32_t n = 0U, i;
+
+    do {
+        digits[n++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while (value != 0U && n < sizeof(digits));
+    for (i = 0U; i < n; i++) {
+        out[i] = digits[n - 1U - i];
+    }
+    return n;
+}
+
+static uint32_t l3_appendField(char *out, uint32_t length, const char *key, uint32_t value)
+{
+    while (*key != '\0') {
+        out[length++] = *key++;
+    }
+    return length + l3_formatUnsigned(&out[length], value);
+}
+
+/* "ILTRG1 seq= age_ms= delay= end= slope_q= frames=" on one line, written
+ * with task switching off so no other output can split it. age_ms runs from
+ * the freeze request (delay frames after the detection) to this write. */
+static void l3_autoWriteNotice(uint32_t seq, uint32_t ageMs, uint8_t delay,
+                               uint8_t end, uint8_t slopeQ, uint16_t frames)
+{
+    char line[128];
+    uint32_t length = 0U;
+    UInt taskKey;
+
+    length = l3_appendField(line, length, L3_AUTO_NOTICE_MAGIC " seq=", seq);
+    length = l3_appendField(line, length, " age_ms=", ageMs);
+    length = l3_appendField(line, length, " delay=", delay);
+    length = l3_appendField(line, length, " end=", end);
+    length = l3_appendField(line, length, " slope_q=", slopeQ);
+    length = l3_appendField(line, length, " frames=", frames);
+    line[length++] = '\n';
+    taskKey = Task_disable();
+    UART_writePolling(gCliUart, (uint8_t *)line, length);
+    Task_restore(taskKey);
+}
+
+static void l3_autoTriggerTask(UArg arg0, UArg arg1)
+{
+    (void)arg0; (void)arg1;
+
+    for (;;) {
+        int32_t taken;
+        uint32_t ageMs;
+
+        Semaphore_pend(gAutoFrozenSemaphore, BIOS_WAIT_FOREVER);
+        l3_reducedLock();
+        taken = l3_autoTakeHold();
+        ageMs = l3_elapsedMs(gAutoFireTick);
+        l3_reducedUnlock();
+        if (taken == 1) {
+            l3_autoWriteNotice(++gAutoSeq, ageMs, gAutoCfg.delay_frames, gAutoFireEnd,
+                               gAutoFireSlopeQ, gHeldCapture.n_frames);
+        }
+    }
+}
+
+/* CLI "autoTrigCfg 0" | "autoTrigCfg 1 endLo endHi frames zMinX10 zCapX10
+ * slopeMinQ slopeMaxQ delay": see auto_trigger.h. */
+static int32_t l3_cli_autoTrigCfg(int32_t argc, char *argv[])
+{
+    at_config_t cfg;
+    long enable, v[8];
+    long limits[8] = {255, 255, (long)AT_MAX_FRAMES, (long)AT_MAX_Z_X10,
+                      (long)AT_MAX_Z_X10, (long)AT_MAX_SLOPE_Q, (long)AT_MAX_SLOPE_Q,
+                      (long)AT_MAX_DELAY};
+    uintptr_t key;
+    int32_t i;
+
+    if ((argc != 2 && argc != 10) || l3_parseBounded(argv[1], 1L, &enable) != 0 ||
+        (argc == 2 && enable != 0L)) {
+        CLI_write("Error: autoTrigCfg 0 | autoTrigCfg 1 endLo endHi frames zMinX10 "
+                  "zCapX10 slopeMinQ slopeMaxQ delay\n");
+        return -1;
+    }
+    memset((void *)&cfg, 0, sizeof(cfg));
+    if (enable) {
+        for (i = 0; i < 8; i++) {
+            if (l3_parseBounded(argv[i + 2], limits[i], &v[i]) != 0) {
+                CLI_write("Error: autoTrigCfg value %d out of range\n", (int)(i + 2));
+                return -1;
+            }
+        }
+        cfg.end_lo = (uint8_t)v[0];
+        cfg.end_hi = (uint8_t)v[1];
+        cfg.n_frames = (uint8_t)v[2];
+        cfg.z_min_x10 = (uint32_t)v[3];
+        cfg.z_cap_x10 = (uint32_t)v[4];
+        cfg.slope_min_q = (uint8_t)v[5];
+        cfg.slope_max_q = (uint8_t)v[6];
+        cfg.delay_frames = (uint8_t)v[7];
+        if (at_check_config(&cfg) != AT_OK) {
+            CLI_write("Error: autoTrigCfg settings are inconsistent\n");
+            return -1;
+        }
+        if (!gOverviewGateSet) {
+            CLI_write("Error: send overviewCfg before autoTrigCfg\n");
+            return -1;
+        }
+    }
+    key = Hwi_disable();
+    gAutoCfgNext = cfg;
+    gAutoEnableNext = (uint8_t)enable;
+    gAutoCfgUpdate = 1U;
+    Hwi_restore(key);
+    if (enable) {
+        CLI_write("Auto trigger: on, end %u-%u, %u frames, z %u/%u, slope %u-%u, delay %u\n",
+                  (unsigned)cfg.end_lo, (unsigned)cfg.end_hi, (unsigned)cfg.n_frames,
+                  (unsigned)cfg.z_min_x10, (unsigned)cfg.z_cap_x10,
+                  (unsigned)cfg.slope_min_q, (unsigned)cfg.slope_max_q,
+                  (unsigned)cfg.delay_frames);
+    } else {
+        CLI_write("Auto trigger: off\n");
+    }
+    return 0;
+}
+#endif
 
 /* Resume a held capture the Pi has abandoned. */
 static void l3_reducedWatchTask(UArg arg0, UArg arg1)
@@ -3630,6 +3938,9 @@ static void l3_reducedWatchTask(UArg arg0, UArg arg1)
         l3_reducedLock();
         if (gReducedHeld && l3_elapsedMs(gReducedHoldTick) >= L3_REDUCED_HOLD_TIMEOUT_MS) {
             gReducedHeld = 0U;
+#ifdef L3_AUTO_TRIGGER
+            gAutoHeld = 0U;
+#endif
             gReducedTimeouts++;
             if (l3_resumeCapture() != 0) {
                 gReducedErrors++;
@@ -3653,7 +3964,24 @@ static int32_t l3_startReducedWatch(void)
     Task_Params_init(&taskParams);
     taskParams.priority = L3_REDUCED_TASK_PRIORITY;
     taskParams.stackSize = 1024U;
-    return (Task_create(l3_reducedWatchTask, &taskParams, NULL) == NULL) ? -1 : 0;
+    if (Task_create(l3_reducedWatchTask, &taskParams, NULL) == NULL) {
+        return -1;
+    }
+#ifdef L3_AUTO_TRIGGER
+    Semaphore_Params_init(&semaphoreParams);
+    semaphoreParams.mode = Semaphore_Mode_BINARY;
+    gAutoFrozenSemaphore = Semaphore_create(0, &semaphoreParams, NULL);
+    if (gAutoFrozenSemaphore == NULL) {
+        return -1;
+    }
+    Task_Params_init(&taskParams);
+    taskParams.priority = L3_AUTO_TASK_PRIORITY;
+    taskParams.stackSize = 1024U;
+    if (Task_create(l3_autoTriggerTask, &taskParams, NULL) == NULL) {
+        return -1;
+    }
+#endif
+    return 0;
 }
 
 /* The SDK CLI stops at the first empty table slot, so append after the last
@@ -3682,6 +4010,11 @@ static void l3_registerReducedCommands(CLI_Cfg *cliCfg)
                   l3_cli_strip);
     l3_addCommand(cliCfg, "l3release", "Resume capture after l3overview/l3strip",
                   l3_cli_release);
+#ifdef L3_AUTO_TRIGGER
+    l3_addCommand(cliCfg, "autoTrigCfg",
+                  "autoTrigCfg 0 | 1 endLo endHi frames zMinX10 zCapX10 slopeMinQ slopeMaxQ delay",
+                  l3_cli_autoTrigCfg);
+#endif
 }
 #endif
 

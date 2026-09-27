@@ -10,7 +10,8 @@ from test_iwr6843_pipeline import synth_shot
 from test_iwr6843_reduced import N_FRAMES, PERIOD_US, _timed_iq8
 
 from openflight.iwr6843 import reduced
-from openflight.iwr6843.driver import IWR6843Radar
+from openflight.iwr6843.autotrigger import AutoTriggerConfig
+from openflight.iwr6843.driver import AutoTriggerNotice, IWR6843Radar, parse_auto_trigger_notice
 from openflight.iwr6843.dump import TEMP_REPORT_KEYS, pack_dump
 
 
@@ -106,10 +107,15 @@ def test_send_config_waits_for_sensor_to_become_active(tmp_path, monkeypatch):
 
 
 class FakeSerial:
-    """Serial double that exposes the in_waiting/read/write pieces read_dump uses."""
+    """Serial double that exposes the in_waiting/read/write pieces read_dump uses.
 
-    def __init__(self, payload: bytes):
-        self.payload = bytearray(payload)
+    Like the real port, the command's ``reply`` arrives after the command is
+    written; ``waiting`` is already in the input buffer (e.g. a notice).
+    """
+
+    def __init__(self, reply: bytes = b"", *, waiting: bytes = b""):
+        self.payload = bytearray(waiting)
+        self.reply = bytes(reply)
         self.writes = []
 
     @property
@@ -121,6 +127,8 @@ class FakeSerial:
 
     def write(self, data: bytes):
         self.writes.append(data)
+        self.payload.extend(self.reply)
+        self.reply = b""
 
     def read(self, nbytes: int):
         nbytes = min(nbytes, len(self.payload))
@@ -140,7 +148,7 @@ def test_read_dump_waits_for_cli_ready_after_binary_payload():
 
         @property
         def in_waiting(self):
-            if self.delay_next_chunk:
+            if self.delay_next_chunk or not self.writes:
                 return 0
             return len(self.chunks[0]) if self.chunks else 0
 
@@ -151,6 +159,8 @@ def test_read_dump_waits_for_cli_ready_after_binary_payload():
             self.writes.append(value)
 
         def read(self, count):
+            if not self.writes:
+                return b""
             if self.delay_next_chunk:
                 self.delay_next_chunk = False
                 return b""
@@ -285,12 +295,15 @@ def test_overview_gate_rejected_by_firmware_raises(monkeypatch):
 class _TimedSerial:
     """Serial double that releases each chunk only after its delay."""
 
-    def __init__(self, chunks):
-        self.start = time.monotonic()
+    def __init__(self, chunks, *, start_on_write=True):
+        """Chunk delays count from the command's write (or from now)."""
+        self.start = None if start_on_write else time.monotonic()
         self.chunks = [(delay, bytearray(data)) for delay, data in chunks]
         self.writes = []
 
     def _ready(self):
+        if self.start is None:
+            return None
         elapsed = time.monotonic() - self.start
         return self.chunks[0][1] if self.chunks and elapsed >= self.chunks[0][0] else None
 
@@ -304,6 +317,8 @@ class _TimedSerial:
 
     def write(self, data):
         self.writes.append(data)
+        if self.start is None:
+            self.start = time.monotonic()
 
     def read(self, count):
         ready = self._ready()
@@ -341,3 +356,123 @@ def test_read_dump_still_gives_up_after_a_stall_following_the_echo():
 
     assert radar.read_dump(timeout_s=5.0, stall_tolerance_s=0.05) == b"l3dump\r\n"
     assert time.monotonic() - start < 1.0
+
+
+# -- auto trigger: the radar detects the shot and sends an ILTRG1 notice -------------
+
+NOTICE = b"ILTRG1 seq=7 age_ms=52 delay=3 end=39 slope_q=6 frames=36\n"
+
+
+class _ClearingSerial(FakeSerial):
+    """Like the real port: reset_input_buffer drops what is waiting; a write
+    queues the command's reply."""
+
+    def __init__(self, waiting: bytes, replies: dict[bytes, bytes]):
+        super().__init__(waiting=waiting)
+        self.replies = replies
+
+    def reset_input_buffer(self):
+        self.payload.clear()
+
+    def write(self, data: bytes):
+        self.writes.append(data)
+        self.payload.extend(self.replies.get(data, b""))
+
+
+def _radar(serial) -> IWR6843Radar:
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    radar.ser = serial
+    return radar
+
+
+def test_parse_auto_trigger_notice():
+    notice = parse_auto_trigger_notice(NOTICE.strip(), received_at=100.0)
+
+    assert notice == AutoTriggerNotice(
+        seq=7, age_ms=52, delay_frames=3, end_bin=39, slope_q=6, n_frames=36, received_at=100.0
+    )
+    assert parse_auto_trigger_notice(b"stats\n", received_at=0.0) is None
+
+
+def test_notice_edge_time_is_the_detection():
+    notice = AutoTriggerNotice(
+        seq=1, age_ms=52, delay_frames=3, end_bin=39, slope_q=6, n_frames=36, received_at=100.0
+    )
+
+    assert notice.detection_timestamp(frame_period_s=0.002) == pytest.approx(100.0 - 0.052 - 0.006)
+
+
+def test_read_notice_skips_other_output():
+    radar = _radar(FakeSerial(waiting=b"l3dump:/>\r\nnoise " + NOTICE))
+
+    notice = radar.read_auto_trigger_notice(timeout_s=0.5)
+
+    assert notice.seq == 7 and notice.end_bin == 39
+
+
+def test_read_notice_assembles_a_line_split_across_reads():
+    radar = _radar(_TimedSerial([(0.0, NOTICE[:20]), (0.05, NOTICE[20:])], start_on_write=False))
+
+    assert radar.read_auto_trigger_notice(timeout_s=1.0).seq == 7
+
+
+def test_read_notice_times_out_quietly():
+    radar = _radar(_TimedSerial([], start_on_write=False))
+    start = time.monotonic()
+
+    assert radar.read_auto_trigger_notice(timeout_s=0.1) is None
+    assert time.monotonic() - start < 0.5
+
+
+def test_a_notice_waiting_before_a_command_is_kept():
+    radar = _radar(_ClearingSerial(NOTICE, {b"stats\n": b"stats\r\nactive=1\r\nDone\r\n"}))
+
+    response = radar.cmd("stats")
+
+    assert "active=1" in response
+    assert radar.read_auto_trigger_notice(timeout_s=0.0).seq == 7
+
+
+def test_a_notice_inside_a_command_reply_is_kept_and_removed_from_it():
+    reply = b"stats\r\n" + NOTICE + b"active=1\r\nDone\r\n"
+    radar = _radar(_ClearingSerial(b"", {b"stats\n": reply}))
+
+    response = radar.cmd("stats")
+
+    assert "ILTRG1" not in response and "Done" in response
+    assert radar.read_auto_trigger_notice(timeout_s=0.0).seq == 7
+
+
+def test_a_notice_before_a_framed_reply_is_kept():
+    overview = reduced.pack_overview(reduced.build_overview(_synthetic_capture(), gate=(48, 98)))
+    radar = _radar(
+        _ClearingSerial(NOTICE, {b"l3overview\n": b"l3overview\r\n" + overview + b"Done\r\n"})
+    )
+
+    assert radar.read_overview(timeout_s=0.5) == overview
+    assert radar.read_auto_trigger_notice(timeout_s=0.0).seq == 7
+
+
+def test_configure_auto_trigger_sends_the_config_line(monkeypatch):
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    sent = []
+
+    def fake_cmd(line, window=1.5):
+        sent.append(line)
+        return "Auto trigger: on\nDone\n"
+
+    monkeypatch.setattr(radar, "cmd", fake_cmd)
+    config = AutoTriggerConfig(end_lo=38, end_hi=40)
+
+    radar.configure_auto_trigger(config)
+    radar.configure_auto_trigger(None)
+
+    assert sent == [config.command(), "autoTrigCfg 0"]
+
+
+def test_configure_auto_trigger_rejected_by_old_firmware(monkeypatch):
+    radar = IWR6843Radar.__new__(IWR6843Radar)
+    monkeypatch.setattr(radar, "cmd", lambda *_a, **_k: "Error: unknown command\n")
+
+    with pytest.raises(RuntimeError, match="autoTrigCfg"):
+        radar.configure_auto_trigger(AutoTriggerConfig(end_lo=38, end_hi=40))

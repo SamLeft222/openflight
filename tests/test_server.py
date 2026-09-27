@@ -5294,3 +5294,129 @@ class TestHardwareTriggerPlumbing:
                 trigger_type="hardware",
                 sample_rate_ksps=25,
             )
+
+
+class TestIwr6843AutoTrigger:
+    """--iwr6843-auto-trigger: the radar detects the shot (no sound edge)."""
+
+    def test_detector_window_is_centred_on_the_tee_bin(self):
+        config = server_module.iwr6843_auto_trigger_config(
+            tee_range_m=1.829, range_bias_m=0.0, end_offsets=(-1, 1), delay_frames=3, z_min=8.0
+        )
+
+        assert (config.end_lo, config.end_hi) == (38, 40)  # 1.829 m / (6 m / 128) = bin 39
+        assert config.delay_frames == 3
+        assert config.z_min_x10 == 80
+
+    def test_detector_window_uses_the_apparent_tee_range(self):
+        config = server_module.iwr6843_auto_trigger_config(
+            tee_range_m=1.829, range_bias_m=0.094, end_offsets=(0, 0), delay_frames=0, z_min=6.5
+        )
+
+        assert (config.end_lo, config.end_hi) == (41, 41)
+        assert config.z_min_x10 == 65
+
+    @pytest.mark.parametrize(
+        ("text", "expected"), [("-1:1", (-1, 1)), ("0:0", (0, 0)), ("-3:2", (-3, 2))]
+    )
+    def test_end_offsets_parse(self, text, expected):
+        assert server_module._parse_bin_offsets(text) == expected
+
+    @pytest.mark.parametrize("text", ["1", "2:1", "a:b", "-1:1:2", ""])
+    def test_end_offsets_reject_bad_text(self, text):
+        with pytest.raises(argparse.ArgumentTypeError):
+            server_module._parse_bin_offsets(text)
+
+    @pytest.mark.parametrize("auto_active", [True, False])
+    def test_init_wires_the_detector_and_reports_the_trigger(
+        self, monkeypatch, tmp_path, auto_active
+    ):
+        captured = {}
+        calibration = Calibration.identity()
+
+        class FakeCaptureMonitor:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.port = "/dev/ttyUSB0"
+                self.reduced_gate = kwargs["reduced_gate"]
+                self.auto_trigger = kwargs["auto_trigger"]
+
+            def start(self, *, armed=True):
+                if not auto_active:
+                    self.auto_trigger = None  # old firmware: back to the GPIO edge
+
+            def stop(self):
+                return None
+
+        monkeypatch.setattr(Calibration, "load", lambda _path: calibration)
+        monkeypatch.setattr("openflight.iwr6843.monitor.IWR6843CaptureMonitor", FakeCaptureMonitor)
+        monkeypatch.setattr("openflight.iwr6843.monitor.tx_order_from_config", lambda _p: "normal")
+
+        assert server_module.init_iwr6843(
+            port="/dev/ttyUSB0",
+            config_path="snapshot.cfg",
+            calibration_path="cal.json",
+            output_dir=tmp_path,
+            trigger_pin=17,
+            tee_range_m=1.829,
+            net_range_m=4.877,
+            tx_order="auto",
+            capture_timeout_s=12.0,
+            reduced_transfer=True,
+            auto_trigger=True,
+            auto_trigger_delay_frames=2,
+            auto_trigger_z_min=7.0,
+            auto_trigger_end_offsets=(-2, 1),
+        )
+
+        expected = server_module.iwr6843_auto_trigger_config(
+            tee_range_m=1.829,
+            range_bias_m=calibration.range_bias_m,
+            end_offsets=(-2, 1),
+            delay_frames=2,
+            z_min=7.0,
+        )
+        assert captured["auto_trigger"] == expected
+        config = server_module.iwr6843_runtime_config
+        if auto_active:
+            assert config["trigger"] == "radar"
+            assert config["auto_trigger"] == expected.command()
+        else:
+            assert config["trigger"] == "gpio"
+            assert config["auto_trigger"] is None
+        server_module.iwr6843_runtime = None
+
+    def test_init_without_the_flag_passes_no_detector(self, monkeypatch, tmp_path):
+        captured = {}
+
+        class FakeCaptureMonitor:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.port = "/dev/ttyUSB0"
+                self.reduced_gate = kwargs["reduced_gate"]
+
+            def start(self, *, armed=True):
+                return None
+
+            def stop(self):
+                return None
+
+        monkeypatch.setattr(Calibration, "load", lambda _path: Calibration.identity())
+        monkeypatch.setattr("openflight.iwr6843.monitor.IWR6843CaptureMonitor", FakeCaptureMonitor)
+        monkeypatch.setattr("openflight.iwr6843.monitor.tx_order_from_config", lambda _p: "normal")
+
+        assert server_module.init_iwr6843(
+            port="/dev/ttyUSB0",
+            config_path="snapshot.cfg",
+            calibration_path="cal.json",
+            output_dir=tmp_path,
+            trigger_pin=17,
+            tee_range_m=1.829,
+            net_range_m=4.877,
+            tx_order="auto",
+            capture_timeout_s=12.0,
+        )
+
+        assert captured["auto_trigger"] is None
+        assert server_module.iwr6843_runtime_config["trigger"] == "gpio"
+        server_module.iwr6843_runtime = None

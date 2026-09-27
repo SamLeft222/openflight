@@ -16,16 +16,54 @@ from __future__ import annotations
 
 import glob
 import logging
+import re
 import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import serial
 
+from openflight.iwr6843.autotrigger import AutoTriggerConfig
 from openflight.iwr6843.dump import HEADER, MAGIC, parse_header, payload_nbytes
 from openflight.iwr6843.reduced import StripRequest, encode_strip_request, overview_nbytes
 
 BAUD = 1_041_667
 _PORT_GLOBS = ("/dev/ttyUSB*", "/dev/tty.SLAB_USBtoUART*")
+
+# The firmware's unsolicited shot notice (l3_dump.c l3_autoWriteNotice).
+AUTO_TRIGGER_NOTICE_MAGIC = "ILTRG1"
+_NOTICE_RE = re.compile(
+    rb"ILTRG1 seq=(\d+) age_ms=(\d+) delay=(\d+) end=(\d+) slope_q=(\d+) frames=(\d+)\r?\n?"
+)
+_NOTICE_TAIL_BYTES = 96  # longer than any notice: keep a split line's start
+
+
+@dataclass(frozen=True)
+class AutoTriggerNotice:
+    """The radar detected a shot and is holding its frozen ring."""
+
+    seq: int
+    age_ms: int  # freeze request -> notice written
+    delay_frames: int  # detection -> freeze request
+    end_bin: int
+    slope_q: int
+    n_frames: int
+    received_at: float
+
+    def detection_timestamp(self, frame_period_s: float) -> float:
+        """Host time of the detection (the club reaching the tee, ~impact)."""
+        return self.received_at - self.age_ms / 1000.0 - self.delay_frames * frame_period_s
+
+
+def parse_auto_trigger_notice(line: bytes, *, received_at: float) -> AutoTriggerNotice | None:
+    """One notice line, or None if it is not one."""
+    match = _NOTICE_RE.search(line)
+    if match is None:
+        return None
+    seq, age_ms, delay, end, slope_q, frames = (int(group) for group in match.groups())
+    return AutoTriggerNotice(seq, age_ms, delay, end, slope_q, frames, received_at)
+
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +121,7 @@ class IWR6843Radar:
 
     def cmd(self, line: str, window: float = 1.5) -> str:
         """Send one CLI line; collect the response until Done/Error/timeout."""
-        self.ser.reset_input_buffer()
+        self._clear_input()
         self.ser.write((line + "\n").encode())
         resp = b""
         deadline = time.time() + window
@@ -91,7 +129,62 @@ class IWR6843Radar:
             resp += self.ser.read(512)
             if b"Done" in resp or b"Error" in resp:
                 break
-        return resp.decode(errors="replace")
+        return self._harvest_notices(resp).decode(errors="replace")
+
+    # -- auto trigger notices ------------------------------------------------------
+
+    def _notice_queue(self) -> deque[AutoTriggerNotice]:
+        queue = getattr(self, "_notices", None)
+        if queue is None:
+            queue = self._notices = deque()
+        return queue
+
+    def _harvest_notices(self, data: bytes) -> bytes:
+        """Queue every complete notice in ``data``; return ``data`` without them.
+
+        The firmware writes a notice whenever it detects a shot, so one can
+        land before or inside a command's reply. It must never be lost.
+        """
+        if b"ILTRG1" not in data:
+            return data
+        now = time.time()
+        for match in _NOTICE_RE.finditer(data):
+            if match.group(0).endswith(b"\n"):
+                self._notice_queue().append(
+                    parse_auto_trigger_notice(match.group(0), received_at=now)
+                )
+        return _NOTICE_RE.sub(lambda m: b"" if m.group(0).endswith(b"\n") else m.group(0), data)
+
+    def _clear_input(self) -> None:
+        """Drop stale input before a command, keeping any notice in it."""
+        waiting = self.ser.in_waiting
+        if waiting:
+            self._harvest_notices(self._notice_buffer() + self.ser.read(waiting))
+            self._notice_tail = b""
+        self.ser.reset_input_buffer()
+
+    def _notice_buffer(self) -> bytes:
+        return getattr(self, "_notice_tail", b"")
+
+    def read_auto_trigger_notice(self, timeout_s: float) -> AutoTriggerNotice | None:
+        """The next shot notice, waiting up to ``timeout_s``; None if none came."""
+        queue = self._notice_queue()
+        deadline = time.monotonic() + timeout_s
+        while not queue:
+            waiting = self.ser.in_waiting
+            chunk = self.ser.read(waiting if waiting else 1) if waiting or timeout_s > 0 else b""
+            if chunk:
+                pending = self._notice_buffer() + chunk
+                remainder = self._harvest_notices(pending)
+                self._notice_tail = remainder[-_NOTICE_TAIL_BYTES:] if remainder else b""
+            if time.monotonic() >= deadline:
+                break
+        return queue.popleft() if queue else None
+
+    def configure_auto_trigger(self, config: AutoTriggerConfig | None) -> None:
+        """Enable on-radar shot detection with ``config``, or disable it with None."""
+        command = config.command() if config is not None else "autoTrigCfg 0"
+        self._require_done("autoTrigCfg", self.cmd(command, 2.0))
 
     def drain_stale_output(
         self,
@@ -244,7 +337,7 @@ class IWR6843Radar:
         best-effort contract.
         """
         name = command.decode().split()[0]
-        self.ser.reset_input_buffer()
+        self._clear_input()
         self.ser.write(command)
         buf = bytearray()
         expected: int | None = None
@@ -270,6 +363,7 @@ class IWR6843Radar:
                         f"IWR6843 {name} failed: {trailer.decode(errors='replace').strip()}"
                     )
                 if idx >= 0 and len(buf) - idx >= HEADER.size:
+                    self._harvest_notices(bytes(buf[:idx]))
                     del buf[:idx]
                     try:
                         expected = size_of(buf)

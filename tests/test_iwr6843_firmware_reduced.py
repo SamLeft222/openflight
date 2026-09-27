@@ -81,7 +81,8 @@ def test_failed_overview_resumes_capture_instead_of_staying_frozen():
     body = _function("static int32_t l3_cli_overview")
 
     failures = body.split("gReducedErrors++")[1:]
-    assert len(failures) == 2
+    # describe/check, prepare, and (auto trigger) the detector hold's gate check
+    assert len(failures) == 3
     for failure in failures:
         assert "l3_resumeCapture()" in failure.split("return -1")[0]
 

@@ -1,4 +1,9 @@
-"""GPIO-triggered IWR6843 L3 capture and OPS-shot correlation."""
+"""IWR6843 L3 capture, triggered by a GPIO edge or by the radar itself.
+
+With ``auto_trigger`` the firmware detects the shot (autotrigger.py) and sends
+a notice instead of the sound sensor's GPIO edge; each notice becomes the same
+trigger edge, so everything downstream is unchanged.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from openflight.gpio_factory import ensure_lgpio_pin_factory
+from openflight.iwr6843.autotrigger import AutoTriggerConfig
 from openflight.iwr6843.driver import IWR6843Radar
 from openflight.iwr6843.dump import HEADER, parse_header, payload_nbytes
 from openflight.iwr6843.reduced import StripRequest, parse_overview
@@ -23,6 +29,18 @@ _GRACEFUL_DUMP_SHUTDOWN_S = 12.0
 # A held reduced-transfer capture nobody finishes is released after this long:
 # under the firmware's own 10 s timeout, so the Pi's state never disagrees.
 DEFAULT_HOLD_BUDGET_S = 8.0
+# How long one notice poll holds the serial port between captures.
+_NOTICE_POLL_S = 0.05
+
+
+def frame_period_s_from_config(config_path: str | Path) -> float:
+    """The frame period from a cfg's ``frameCfg`` (its fifth field, in ms)."""
+    with Path(config_path).open(encoding="utf-8") as handle:
+        for raw_line in handle:
+            fields = raw_line.split()
+            if fields and fields[0] == "frameCfg" and len(fields) >= 6:
+                return float(fields[5]) / 1000.0
+    raise ValueError(f"IWR6843 config {config_path} has no frameCfg")
 
 
 def tx_order_from_config(config_path: str | Path) -> str:
@@ -109,6 +127,7 @@ class IWR6843CaptureMonitor:
         trigger_observers: list[Callable[[float], None]] | None = None,
         reduced_gate: tuple[int, int] | None = None,
         hold_budget_s: float = DEFAULT_HOLD_BUDGET_S,
+        auto_trigger: AutoTriggerConfig | None = None,
     ):
         self.config_path = Path(config_path)
         self.output_dir = Path(output_dir).expanduser()
@@ -133,8 +152,13 @@ class IWR6843CaptureMonitor:
         # _serial_lock; _hold names the held capture.
         self.reduced_gate = reduced_gate
         self.hold_budget_s = hold_budget_s
-        self._serial_lock = threading.Lock()
+        # Re-entrant: the full-dump fallback reads the ring inside a locked call.
+        self._serial_lock = threading.RLock()
         self._hold: _Hold | None = None
+        # The radar's own shot detector instead of the GPIO edge (needs the
+        # reduced transfer, which holds the detected ring).
+        self.auto_trigger = auto_trigger
+        self._listener: threading.Thread | None = None
         # Edges the OPS rejected before their capture completed.
         self._rejected_edges: deque[float] = deque(maxlen=16)
 
@@ -166,19 +190,23 @@ class IWR6843CaptureMonitor:
                         exc,
                     )
                     self.reduced_gate = None
+            self._configure_auto_trigger()
 
-            button_factory = self._button_factory
-            if button_factory is None:
-                # Must precede the first gpiozero device: on a Pi 5 gpiozero's
-                # own auto-detection fails outright. See gpio_factory.
-                ensure_lgpio_pin_factory()
+            if self.auto_trigger is None:
+                button_factory = self._button_factory
+                if button_factory is None:
+                    # Must precede the first gpiozero device: on a Pi 5 gpiozero's
+                    # own auto-detection fails outright. See gpio_factory.
+                    ensure_lgpio_pin_factory()
 
-                from gpiozero import Button  # pylint: disable=import-error,import-outside-toplevel
+                    from gpiozero import (  # pylint: disable=import-error,import-outside-toplevel
+                        Button,
+                    )
 
-                button_factory = Button
-            # No gpiozero debounce: lgpio delays delivery by the debounce interval,
-            # which previously cost the first 50 ms of ball flight.
-            self._button = button_factory(self.gpio_pin, pull_up=False, bounce_time=None)
+                    button_factory = Button
+                # No gpiozero debounce: lgpio delays delivery by the debounce
+                # interval, which previously cost the first 50 ms of ball flight.
+                self._button = button_factory(self.gpio_pin, pull_up=False, bounce_time=None)
             self._running = True
             self._worker = threading.Thread(
                 target=self._capture_loop,
@@ -186,6 +214,13 @@ class IWR6843CaptureMonitor:
                 daemon=True,
             )
             self._worker.start()
+            if self.auto_trigger is not None:
+                self._listener = threading.Thread(
+                    target=self._notice_loop,
+                    name="iwr6843-auto-trigger",
+                    daemon=True,
+                )
+                self._listener.start()
             if armed:
                 self.arm()
         except Exception:
@@ -199,12 +234,65 @@ class IWR6843CaptureMonitor:
                 self.radar.close()
             raise
         logger.info(
-            "[IWR6843] Configured on BCM%d using %s (%s%s)",
-            self.gpio_pin,
+            "[IWR6843] Configured on %s using %s (%s%s)",
+            "its own shot detector" if self.auto_trigger else f"BCM{self.gpio_pin}",
             self.port,
             self.config_path.name,
             ", armed" if self._armed else ", waiting for OPS",
         )
+
+    def _configure_auto_trigger(self) -> None:
+        """Enable the firmware's detector, or fall back to the GPIO edge."""
+        if self.auto_trigger is None:
+            return
+        if self.reduced_gate is None:
+            logger.warning("[IWR6843] Auto trigger needs the reduced transfer; using the GPIO edge")
+            self.auto_trigger = None
+            return
+        try:
+            self.radar.configure_auto_trigger(self.auto_trigger)
+        except RuntimeError as exc:
+            logger.warning(
+                "[IWR6843] Firmware lacks the shot detector (%s); using the GPIO edge", exc
+            )
+            self.auto_trigger = None
+            return
+        self._frame_period_s = frame_period_s_from_config(self.config_path)
+        logger.info("[IWR6843] Shot detector on: %s", self.auto_trigger.command())
+
+    def _notice_loop(self) -> None:
+        """Turn the radar's shot notices into trigger edges between captures."""
+        while self._running:
+            with self._condition:
+                idle = not self._capture_active and self._events.empty()
+            if not idle:
+                time.sleep(0.01)
+                continue
+            try:
+                with self._serial_lock:
+                    notice = self.radar.read_auto_trigger_notice(timeout_s=_NOTICE_POLL_S)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning("[IWR6843] Shot notice read failed", exc_info=True)
+                time.sleep(0.1)
+                continue
+            if notice is None:
+                continue
+            edge = notice.detection_timestamp(self._frame_period_s)
+            logger.info(
+                "[IWR6843] Radar detected a shot (#%d, club at bin %d, %.1f bins/frame)",
+                notice.seq,
+                notice.end_bin,
+                notice.slope_q / 4.0,
+            )
+            if not self.notify_trigger(edge):
+                # Not armed yet (or already busy): the radar is holding a ring
+                # nobody will fetch. Let it go rather than wait for a timeout.
+                logger.info("[IWR6843] Shot notice ignored; releasing the radar")
+                try:
+                    with self._serial_lock:
+                        self.radar.release()
+                except Exception:  # pylint: disable=broad-exception-caught
+                    logger.warning("[IWR6843] Release after ignored notice failed", exc_info=True)
 
     def arm(self) -> None:
         """Accept GPIO edges after the OPS trigger path is fully initialized."""
@@ -212,11 +300,15 @@ class IWR6843CaptureMonitor:
             raise RuntimeError("cannot arm an IWR6843 monitor that is not running")
         if self._armed:
             return
-        # Attach while logically disarmed so a line already high from OPS
-        # startup cannot synchronously create a false capture.
-        self._button.when_pressed = self.notify_trigger
+        if self._button is not None:
+            # Attach while logically disarmed so a line already high from OPS
+            # startup cannot synchronously create a false capture.
+            self._button.when_pressed = self.notify_trigger
         self._armed = True
-        logger.info("[IWR6843] Armed on BCM%d", self.gpio_pin)
+        logger.info(
+            "[IWR6843] Armed on %s",
+            "its own shot detector" if self.auto_trigger else f"BCM{self.gpio_pin}",
+        )
 
     def notify_trigger(self, timestamp: float | None = None) -> bool:
         """Queue a GPIO edge without doing serial work in the callback."""
@@ -386,11 +478,13 @@ class IWR6843CaptureMonitor:
                     if self.reduced_gate is not None
                     else "dumping firmware-frozen L3 ring",
                 )
-                if self.reduced_gate is not None:
-                    result = self._read_reduced(sequence, edge_timestamp)
-                else:
-                    raw, path, metadata = self._read_full(sequence, edge_timestamp)
-                    result = {"raw": raw, "path": path, "metadata": metadata}
+                # The notice listener polls the same port between captures.
+                with self._serial_lock:
+                    if self.reduced_gate is not None:
+                        result = self._read_reduced(sequence, edge_timestamp)
+                    else:
+                        raw, path, metadata = self._read_full(sequence, edge_timestamp)
+                        result = {"raw": raw, "path": path, "metadata": metadata}
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 error = str(exc)
                 logger.warning("[IWR6843] Capture #%d failed: %s", sequence, exc, exc_info=True)
@@ -555,6 +649,9 @@ class IWR6843CaptureMonitor:
             self._events.put_nowait(None)
         except queue.Full:
             pass
+        if self._listener is not None:
+            self._listener.join(timeout=1.0)
+            self._listener = None
         self._release_hold_for_shutdown()
         if self._worker is not None:
             # Preserve a complete debug dump and its trailing CLI prompt before

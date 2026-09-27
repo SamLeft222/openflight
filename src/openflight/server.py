@@ -1098,6 +1098,44 @@ def init_camera_capture(
         return False
 
 
+def iwr6843_auto_trigger_config(
+    *,
+    tee_range_m: float,
+    range_bias_m: float,
+    end_offsets: tuple[int, int],
+    delay_frames: int,
+    z_min: float,
+):
+    """The radar's shot detector, centred on the tee's apparent range bin."""
+    from .iwr6843.autotrigger import AutoTriggerConfig  # pylint: disable=import-outside-toplevel
+    from .iwr6843.reduced import RANGE_FFT_SIZE  # pylint: disable=import-outside-toplevel
+    from .iwr6843.tracking import RANGE_SPAN_M  # pylint: disable=import-outside-toplevel
+
+    tee_bin = round((tee_range_m + range_bias_m) / (RANGE_SPAN_M / RANGE_FFT_SIZE))
+    return AutoTriggerConfig(
+        end_lo=tee_bin + end_offsets[0],
+        end_hi=tee_bin + end_offsets[1],
+        delay_frames=delay_frames,
+        z_min_x10=round(z_min * 10),
+    )
+
+
+def _parse_bin_offsets(text: str) -> tuple[int, int]:
+    """``LO:HI`` range-bin offsets from the tee, LO <= HI."""
+    import argparse  # pylint: disable=import-outside-toplevel
+
+    parts = text.split(":")
+    try:
+        if len(parts) != 2:
+            raise ValueError(text)
+        low, high = int(parts[0]), int(parts[1])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"expected LO:HI bin offsets, got {text!r}") from error
+    if low > high:
+        raise argparse.ArgumentTypeError(f"LO must not exceed HI, got {text!r}")
+    return low, high
+
+
 def init_iwr6843(
     *,
     port: str | None,
@@ -1117,13 +1155,19 @@ def init_iwr6843(
     save_dumps: bool = False,
     reduced_transfer: bool = False,
     reduced_full_dump: bool = False,
+    auto_trigger: bool = False,
+    auto_trigger_delay_frames: int = 3,
+    auto_trigger_z_min: float = 8.0,
+    auto_trigger_end_offsets: tuple[int, int] = (-1, 1),
 ) -> bool:
     """Initialize GPIO-triggered TI capture and the frozen LCMF-v1 estimator.
 
     ``reduced_transfer`` fetches an on-chip overview plus strips instead of the
     whole capture (plans/iwr6843-on-chip-reduction.md; needs the reduced-
     transfer firmware). ``reduced_full_dump`` also streams each held capture
-    whole afterwards, for offline analysis and club path.
+    whole afterwards, for offline analysis and club path. ``auto_trigger`` has
+    the radar detect the shot itself instead of waiting for the GPIO edge
+    (autotrigger.py; needs the reduced transfer).
     """
     global iwr6843_runtime, iwr6843_runtime_config  # pylint: disable=global-statement
     try:
@@ -1149,6 +1193,17 @@ def init_iwr6843(
             calibration.meta["radar_height_m"] = radar_height_m
 
         reduced_gate = default_ball_gate(net_range_m) if reduced_transfer else None
+        detector = (
+            iwr6843_auto_trigger_config(
+                tee_range_m=tee_range_m,
+                range_bias_m=calibration.range_bias_m,
+                end_offsets=auto_trigger_end_offsets,
+                delay_frames=auto_trigger_delay_frames,
+                z_min=auto_trigger_z_min,
+            )
+            if auto_trigger
+            else None
+        )
         capture_monitor = IWR6843CaptureMonitor(
             config_path=config_path,
             output_dir=output_dir,
@@ -1156,6 +1211,7 @@ def init_iwr6843(
             gpio_pin=trigger_pin,
             save_dumps=save_dumps,
             reduced_gate=reduced_gate,
+            auto_trigger=detector,
             trigger_observers=(
                 [camera_capture_runtime.notify_trigger]
                 if camera_capture_runtime is not None
@@ -1180,6 +1236,8 @@ def init_iwr6843(
             reduced_full_dump=reduced_full_dump,
         )
         active_gate = getattr(capture_monitor, "reduced_gate", None)
+        # What the monitor runs: old firmware falls back to the GPIO edge.
+        active_detector = getattr(capture_monitor, "auto_trigger", None)
         iwr6843_runtime_config = {
             "enabled": True,
             "estimator": "lcmf_v1",
@@ -1204,6 +1262,8 @@ def init_iwr6843(
             "transfer": "reduced" if active_gate is not None else "full",
             "reduced_gate": list(active_gate) if active_gate is not None else None,
             "reduced_full_dump": reduced_full_dump,
+            "trigger": "radar" if active_detector is not None else "gpio",
+            "auto_trigger": active_detector.command() if active_detector is not None else None,
         }
         logger.info(
             "[SERVER] IWR6843 initialized "
@@ -4730,6 +4790,35 @@ def main():
         ),
     )
     parser.add_argument(
+        "--iwr6843-auto-trigger",
+        action="store_true",
+        help=(
+            "Let the IWR6843 detect the shot itself (the club reaching the tee) "
+            "instead of waiting for the sound sensor's GPIO edge. Needs "
+            "--iwr6843-reduced-transfer and the auto-trigger firmware; falls back "
+            "to the GPIO edge on older firmware."
+        ),
+    )
+    parser.add_argument(
+        "--iwr6843-auto-trigger-delay-frames",
+        type=int,
+        default=3,
+        help="Frames (2 ms each) between detecting the club and freezing (default: 3)",
+    )
+    parser.add_argument(
+        "--iwr6843-auto-trigger-z-min",
+        type=float,
+        default=8.0,
+        help="Club track strength over the frame median, every frame (default: 8.0)",
+    )
+    parser.add_argument(
+        "--iwr6843-auto-trigger-end-bins",
+        type=_parse_bin_offsets,
+        default=(-1, 1),
+        metavar="LO:HI",
+        help="Where the club track must end, in range bins from the tee (default: -1:1)",
+    )
+    parser.add_argument(
         "--iwr6843-output-dir",
         default=None,
         help=("Raw TI dump directory when --debug is enabled (default: <session-log-dir>/iwr6843)"),
@@ -4885,6 +4974,12 @@ def main():
         parser.error("--iwr6843-reduced-transfer requires --iwr6843")
     if args.iwr6843_reduced_full_dump and not args.iwr6843_reduced_transfer:
         parser.error("--iwr6843-reduced-full-dump requires --iwr6843-reduced-transfer")
+    if args.iwr6843_auto_trigger and not args.iwr6843_reduced_transfer:
+        parser.error("--iwr6843-auto-trigger requires --iwr6843-reduced-transfer")
+    if not 0 <= args.iwr6843_auto_trigger_delay_frames <= 32:
+        parser.error("--iwr6843-auto-trigger-delay-frames must be 0..32")
+    if not 0.1 <= args.iwr6843_auto_trigger_z_min <= 50.0:
+        parser.error("--iwr6843-auto-trigger-z-min must be 0.1..50")
     if args.camera_capture and (
         args.camera_capture_width <= 0
         or args.camera_capture_height <= 0
@@ -5080,6 +5175,10 @@ def main():
             save_dumps=args.debug,
             reduced_transfer=args.iwr6843_reduced_transfer,
             reduced_full_dump=args.iwr6843_reduced_full_dump,
+            auto_trigger=args.iwr6843_auto_trigger,
+            auto_trigger_delay_frames=args.iwr6843_auto_trigger_delay_frames,
+            auto_trigger_z_min=args.iwr6843_auto_trigger_z_min,
+            auto_trigger_end_offsets=args.iwr6843_auto_trigger_end_bins,
         ):
             calibration = iwr6843_runtime.calibration
             ball_speed_correction_distance_ft = args.iwr6843_tee_m * 3.28084

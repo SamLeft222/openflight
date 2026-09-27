@@ -915,6 +915,12 @@ class HardwareTriggeredCapture(TriggerStrategy):
                 reason="no_ball_speed",
                 response_bytes=response_bytes,
                 trigger_latency_ms=trigger_latency_ms,
+                # Lets the IWR6843 release the ring it froze for this swing.
+                trigger_timestamp=(
+                    capture.trigger_timestamp
+                    if capture.trigger_timestamp is not None
+                    else capture.infer_trigger_timestamp_from_first_byte()
+                ),
             )
             logger.info(
                 "[TRIGGER] OPS hardware capture rejected — no outbound speed >= %.1f mph",
